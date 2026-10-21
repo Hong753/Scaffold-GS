@@ -2,17 +2,19 @@
 
 import ast
 import importlib.util
+import io
 import json
 import os
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import NamedTuple
+import warnings
 
 import numpy as np
 import pytest
 import torch
-from PIL import Image
+from PIL import Image, ImageFile
 
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import focal2fov, fov2focal
@@ -80,6 +82,65 @@ def test_selected_camera_rereads_disk_and_keeps_no_tensor(camera_utils, tmp_path
     assert first[1].eq(0).all() and second[0].eq(0).all()
     assert camera._image is None
     torch.testing.assert_close(camera.original_image, second)
+
+
+def jpeg_bytes():
+    pixels = np.random.default_rng(42).integers(0, 256, (48, 64, 3), dtype=np.uint8)
+    stream = io.BytesIO()
+    Image.fromarray(pixels).save(stream, format="JPEG", quality=90)
+    return stream.getvalue()
+
+
+def test_truncated_selected_image_recovers_without_caching(camera_utils, monkeypatch, tmp_path):
+    path = tmp_path / "truncated.jpg"
+    path.write_bytes(jpeg_bytes()[:-32])
+    monkeypatch.setattr(ImageFile, "LOAD_TRUNCATED_IMAGES", False)
+    with Image.open(path) as source, pytest.raises(OSError, match="truncated"):
+        source.load()
+
+    args = SimpleNamespace(resolution=2, data_device="cpu")
+    camera = camera_utils.loadCam(args, 0, camera_info(path), 1.0)
+    opened = []
+    original_open = Image.open
+
+    def track_open(*args, **kwargs):
+        image = original_open(*args, **kwargs)
+        opened.append(image)
+        return image
+
+    monkeypatch.setattr(Image, "open", track_open)
+    with pytest.warns(RuntimeWarning, match="Recovered truncated image") as messages:
+        selected = camera.load_image("cpu")
+    assert str(path) in str(messages[0].message)
+    assert selected.shape == (3, 24, 32) and torch.isfinite(selected).all()
+    assert 0 <= selected.min() <= selected.max() <= 1
+    assert opened and all(image.fp is None for image in opened)
+    assert not ImageFile.LOAD_TRUNCATED_IMAGES
+
+    with warnings.catch_warnings(record=True) as messages:
+        warnings.simplefilter("always")
+        torch.testing.assert_close(camera.load_image("cpu"), selected)
+    assert not messages
+
+    # Recovery never caches image pixels: repairing the source is visible on
+    # the very next selection, with no restart or camera reconstruction.
+    Image.new("RGB", (64, 48), (0, 255, 0)).save(path, format="PNG")
+    repaired = camera.load_image("cpu")
+    assert repaired[1].eq(1).all() and repaired[[0, 2]].eq(0).all()
+    assert camera._image is None
+    assert not ImageFile.LOAD_TRUNCATED_IMAGES
+
+
+@pytest.mark.parametrize("data", [b"not an image", jpeg_bytes()[:100]])
+def test_unrecoverable_image_reports_path_and_restores_pillow(monkeypatch, tmp_path, data):
+    path = tmp_path / "broken.jpg"
+    path.write_bytes(data)
+    monkeypatch.setattr(ImageFile, "LOAD_TRUNCATED_IMAGES", False)
+    with pytest.raises(OSError, match="Could not load camera image") as failure:
+        load_image_tensor(path, (32, 24))
+    assert str(path) in str(failure.value)
+    assert isinstance(failure.value.__cause__, OSError)
+    assert not ImageFile.LOAD_TRUNCATED_IMAGES
 
 
 @pytest.mark.parametrize("background", [None, [0, 0, 0], [1, 1, 1]])
