@@ -17,6 +17,7 @@ from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
 import os
 import tempfile
+from time import perf_counter
 from types import SimpleNamespace
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
@@ -26,6 +27,7 @@ from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
 from utils.neural_gaussians import generate_neural_gaussians
 from utils.sh_utils import RGB2SH
+from utils.voxel_utils import voxelize_points
 
     
 class GaussianModel:
@@ -232,36 +234,48 @@ class GaussianModel:
         return self.covariance_activation(self.get_scaling, scaling_modifier, self._rotation)
     
     def voxelize_sample(self, data=None, voxel_size=0.01):
-        np.random.shuffle(data)
-        data = np.unique(np.round(data/voxel_size), axis=0)*voxel_size
-        
-        return data
+        # Small inputs avoid device-transfer overhead. Larger inputs deduplicate
+        # scalar voxel keys on the same device as the neural decoders.
+        device = next(self.mlp_opacity.parameters()).device if len(data) >= 100000 else None
+        return voxelize_points(data, voxel_size, device=device)
 
     def create_from_pcd(self, pcd : BasicPointCloud, spatial_lr_scale : float):
         self.spatial_lr_scale = spatial_lr_scale
         points = pcd.points[::self.ratio]
 
         if self.voxel_size <= 0:
+            print("[Init] Estimating voxel size with nearest neighbors...", flush=True)
+            estimate_start = perf_counter()
             init_points = torch.tensor(points).float().cuda()
             init_dist = distCUDA2(init_points).float().cuda()
             median_dist, _ = torch.kthvalue(init_dist, int(init_dist.shape[0]*0.5))
             self.voxel_size = median_dist.item()
+            print("[Init] Voxel-size estimation: {:.2f}s".format(perf_counter() - estimate_start), flush=True)
             del init_dist
             del init_points
             torch.cuda.empty_cache()
 
-        print(f'Initial voxel_size: {self.voxel_size}')
+        print(f'Initial voxel_size: {self.voxel_size}', flush=True)
         
         
+        print("[Init] Voxelizing {:,} source points...".format(len(points)), flush=True)
+        voxel_start = perf_counter()
         points = self.voxelize_sample(points, voxel_size=self.voxel_size)
-        fused_point_cloud = torch.tensor(np.asarray(points)).float().cuda()
+        print("[Init] Voxelization: {:.2f}s; {:,} anchors".format(perf_counter() - voxel_start, len(points)), flush=True)
+        device = next(self.mlp_opacity.parameters()).device
+        fused_point_cloud = torch.from_numpy(np.ascontiguousarray(points)).to(device=device, dtype=torch.float32)
         offsets = torch.zeros((fused_point_cloud.shape[0], self.n_offsets, 3)).float().cuda()
         anchors_feat = torch.zeros((fused_point_cloud.shape[0], self.feat_dim)).float().cuda()
         
-        print("Number of points at initialisation : ", fused_point_cloud.shape[0])
+        print("Number of points at initialisation : ", fused_point_cloud.shape[0], flush=True)
 
+        torch.cuda.synchronize(device)
+        print("[Init] Computing nearest-neighbor scales...", flush=True)
+        neighbors_start = perf_counter()
         dist2 = torch.clamp_min(distCUDA2(fused_point_cloud).float().cuda(), 0.0000001)
         scales = torch.log(torch.sqrt(dist2))[...,None].repeat(1, 6)
+        torch.cuda.synchronize(device)
+        print("[Init] Nearest-neighbor scales: {:.2f}s".format(perf_counter() - neighbors_start), flush=True)
         
         rots = torch.zeros((fused_point_cloud.shape[0], 4), device="cuda")
         rots[:, 0] = 1
