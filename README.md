@@ -122,6 +122,10 @@ The BungeeNeRF dataset is available in [Google Drive](https://drive.google.com/f
 
 ### Custom Data
 
+The Python loader accepts COLMAP models in either `sparse/` or `sparse/0/`,
+using binary or text camera files. If both layouts contain a camera model,
+`sparse/` takes precedence. The selected directory is also used for `points3D`.
+
 For custom data, you should process the image sequences with [Colmap](https://colmap.github.io/) to obtain the SfM points and camera poses. Then, place the results into ```data/``` folder.
 
 

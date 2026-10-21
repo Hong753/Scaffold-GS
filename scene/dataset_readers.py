@@ -146,15 +146,28 @@ def storePly(path, xyz, rgb):
     ply_data = PlyData([vertex_element])
     ply_data.write(path)
 
+def _find_colmap_sparse_dir(path):
+    # Prefer the flat layout when both contain a camera model. Keep cameras
+    # and points in the same selected directory rather than mixing models.
+    for directory in (os.path.join(path, "sparse"), os.path.join(path, "sparse", "0")):
+        for extension in (".bin", ".txt"):
+            if all(os.path.isfile(os.path.join(directory, name + extension))
+                   for name in ("cameras", "images")):
+                return directory
+    raise FileNotFoundError(
+        "No COLMAP cameras/images pair (.bin or .txt) found in sparse/ or sparse/0/ under {}".format(path))
+
+
 def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
+    sparse_dir = _find_colmap_sparse_dir(path)
     try:
-        cameras_extrinsic_file = os.path.join(path, "sparse", "images.bin")
-        cameras_intrinsic_file = os.path.join(path, "sparse", "cameras.bin")
+        cameras_extrinsic_file = os.path.join(sparse_dir, "images.bin")
+        cameras_intrinsic_file = os.path.join(sparse_dir, "cameras.bin")
         cam_extrinsics = read_extrinsics_binary(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_binary(cameras_intrinsic_file)
     except:
-        cameras_extrinsic_file = os.path.join(path, "sparse", "images.txt")
-        cameras_intrinsic_file = os.path.join(path, "sparse", "cameras.txt")
+        cameras_extrinsic_file = os.path.join(sparse_dir, "images.txt")
+        cameras_intrinsic_file = os.path.join(sparse_dir, "cameras.txt")
         cam_extrinsics = read_extrinsics_text(cameras_extrinsic_file)
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
@@ -183,9 +196,9 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
 
     nerf_normalization = getNerfppNorm(train_cam_infos)
 
-    ply_path = os.path.join(path, "sparse/points3D.ply")
-    bin_path = os.path.join(path, "sparse/points3D.bin")
-    txt_path = os.path.join(path, "sparse/points3D.txt")
+    ply_path = os.path.join(sparse_dir, "points3D.ply")
+    bin_path = os.path.join(sparse_dir, "points3D.bin")
+    txt_path = os.path.join(sparse_dir, "points3D.txt")
     if not os.path.exists(ply_path):
         print("Converting point3d.bin to .ply, will happen only the first time you open the scene.")
         try:
