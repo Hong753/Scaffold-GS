@@ -24,7 +24,7 @@ from argparse import ArgumentParser
 
 def readImages(renders_dir, gt_dir):
     """Yield one decoded pair at a time, closing files before yielding."""
-    for fname in os.listdir(renders_dir):
+    for fname in sorted(os.listdir(renders_dir)):
         with Image.open(renders_dir / fname) as render:
             render_tensor = tf.to_tensor(render).unsqueeze(0)[:, :3, :, :]
         with Image.open(gt_dir / fname) as gt:
@@ -76,6 +76,10 @@ def evaluate(model_paths):
                     ssims.append(ssim(rendering, gt))
                     psnrs.append(psnr(rendering, gt))
                     lpipss.append(lpips_fn(rendering, gt).detach())
+
+                if not image_names:
+                    print("  No valid rendered image pairs; skipping metrics.")
+                    continue
 
                 print("  SSIM : {:>12.7f}".format(torch.tensor(ssims).mean(), ".5"))
                 print("  PSNR : {:>12.7f}".format(torch.tensor(psnrs).mean(), ".5"))

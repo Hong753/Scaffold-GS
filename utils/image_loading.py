@@ -1,5 +1,7 @@
 """Load one camera image from disk without retaining a decoded-image cache."""
 
+from contextlib import contextmanager
+from random import randrange
 from threading import Lock
 import warnings
 
@@ -10,46 +12,59 @@ from utils.general_utils import PILtoTorch
 
 
 _decode_lock = Lock()
-_warned_truncated_paths = set()
+_warned_corrupt_paths = set()
+
+
+class CorruptImageError(OSError):
+    """Image data could not be decoded; filesystem failures remain separate."""
+
+    def __init__(self, path, error):
+        self.image_path = str(path)
+        super().__init__(f"Could not decode camera image {self.image_path!r}: {error}")
+
+
+def warn_corrupt_image(error):
+    if error.image_path not in _warned_corrupt_paths:
+        warnings.warn(f"Skipping corrupt image: {error}", RuntimeWarning, stacklevel=2)
+        _warned_corrupt_paths.add(error.image_path)
+
+
+@contextmanager
+def open_image(path):
+    """Read strictly, close the file, and distinguish corruption from I/O errors."""
+    try:
+        with _decode_lock:
+            # Enforce strict decoding even if another module enabled recovery.
+            previous = ImageFile.LOAD_TRUNCATED_IMAGES
+            try:
+                ImageFile.LOAD_TRUNCATED_IMAGES = False
+                with Image.open(path) as image:
+                    yield image
+            finally:
+                ImageFile.LOAD_TRUNCATED_IMAGES = previous
+    except OSError as error:
+        if error.errno is None:
+            raise CorruptImageError(path, error) from error
+        raise OSError(error.errno, f"Could not load camera image: {error}", str(path)) from error
+
+
+def sample_training_camera(cameras, stack, device):
+    """Return a valid view for this step, excluding known corrupt views."""
+    while True:
+        if not stack:
+            stack = [camera for camera in cameras if not camera.image_invalid]
+            if not stack:
+                raise RuntimeError("No decodable training images remain; check the reported image paths.")
+        camera = stack.pop(randrange(len(stack)))
+        image = camera.try_load_image(device)
+        if image is not None:
+            return camera, image, stack
 
 
 def load_image_tensor(path, resolution, options=None):
-    """Load one image, retrying recoverable truncation without caching pixels."""
-    try:
-        # Pillow's recovery setting is global. Serialize our decodes so another
-        # camera cannot observe the temporary setting, and always restore it.
-        with _decode_lock:
-            try:
-                return _decode_image_tensor(path, resolution, options)
-            except OSError as error:
-                if "truncated" not in str(error).lower():
-                    raise
-
-            previous = ImageFile.LOAD_TRUNCATED_IMAGES
-            try:
-                ImageFile.LOAD_TRUNCATED_IMAGES = True
-                image = _decode_image_tensor(path, resolution, options)
-            finally:
-                ImageFile.LOAD_TRUNCATED_IMAGES = previous
-
-            key = str(path)
-            if key not in _warned_truncated_paths:
-                warnings.warn(
-                    f"Recovered truncated image {key!r}. Some pixels may be "
-                    "missing or corrupted; replace or re-export this source image.",
-                    RuntimeWarning,
-                    stacklevel=2,
-                )
-                _warned_truncated_paths.add(key)
-            return image
-    except OSError as error:
-        raise OSError(f"Could not load camera image {str(path)!r}: {error}") from error
-
-
-def _decode_image_tensor(path, resolution, options=None):
     """Decode, preprocess and resize one image; always close its source file."""
     options = options or {}
-    with Image.open(path) as source:
+    with open_image(path) as source:
         image = source
         if "undistortion" in options:
             import cv2

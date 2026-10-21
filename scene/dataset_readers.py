@@ -13,6 +13,7 @@ import os
 import glob
 import sys
 from PIL import Image
+from utils.image_loading import CorruptImageError, open_image, warn_corrupt_image
 from tqdm import tqdm
 from typing import NamedTuple
 from colorama import Fore, init, Style
@@ -53,6 +54,9 @@ class SceneInfo(NamedTuple):
     ply_path: str
 
 def getNerfppNorm(cam_info):
+    if not cam_info:
+        raise RuntimeError("No training cameras remain; check the reported image paths.")
+
     def get_center_and_diag(cam_centers):
         cam_centers = np.hstack(cam_centers)
         avg_cam_center = np.mean(cam_centers, axis=1, keepdims=True)
@@ -270,8 +274,12 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
-            with Image.open(image_path) as source:
-                image_width, image_height = source.size
+            try:
+                with open_image(image_path) as source:
+                    image_width, image_height = source.size
+            except CorruptImageError as error:
+                warn_corrupt_image(error)
+                continue
 
             if undistorted:
                 image_options = {"undistortion": {

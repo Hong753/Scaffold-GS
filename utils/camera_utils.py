@@ -10,16 +10,16 @@
 #
 
 from scene.cameras import Camera
-from PIL import Image
 import numpy as np
 from utils.graphics_utils import fov2focal
+from utils.image_loading import CorruptImageError, open_image, warn_corrupt_image
 
 WARNED = False
 
 def loadCam(args, id, cam_info, resolution_scale):
     # Read dimensions only. RGB decoding and tensor allocation happen when the
     # selected camera's load_image() is called by training or evaluation.
-    with Image.open(cam_info.image_path) as image:
+    with open_image(cam_info.image_path) as image:
         orig_w, orig_h = image.size
 
     if args.resolution in [1, 2, 4, 8]:
@@ -52,7 +52,10 @@ def cameraList_from_camInfos(cam_infos, resolution_scale, args):
     camera_list = []
 
     for id, c in enumerate(cam_infos):
-        camera_list.append(loadCam(args, id, c, resolution_scale))
+        try:
+            camera_list.append(loadCam(args, id, c, resolution_scale))
+        except CorruptImageError as error:
+            warn_corrupt_image(error)
 
     return camera_list
 

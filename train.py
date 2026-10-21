@@ -31,7 +31,6 @@ from PIL import Image
 import torchvision.transforms.functional as tf
 # from lpipsPyTorch import lpips
 import lpips
-from random import randint
 from utils.loss_utils import l1_loss, ssim
 from gaussian_renderer import prefilter_voxel, render, network_gui
 import sys
@@ -40,6 +39,7 @@ from utils.general_utils import safe_state
 import uuid
 from tqdm import tqdm
 from utils.image_utils import psnr
+from utils.image_loading import sample_training_camera
 from argparse import ArgumentParser, Namespace
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
@@ -121,10 +121,10 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
 
         
-        # Pick a random Camera
-        if not viewpoint_stack:
-            viewpoint_stack = scene.getTrainCameras().copy()
-        viewpoint_cam = viewpoint_stack.pop(randint(0, len(viewpoint_stack)-1))
+        # Decode before rendering. A corrupt view is replaced within this step,
+        # so skipped files do not consume optimization iterations.
+        viewpoint_cam, gt_image, viewpoint_stack = sample_training_camera(
+            scene.getTrainCameras(), viewpoint_stack, background.device)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -136,7 +136,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
-        gt_image = viewpoint_cam.load_image(image.device)
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -229,6 +228,7 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
+                valid_views = 0
                 
                 if wandb is not None:
                     gt_image_list = []
@@ -236,9 +236,13 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                     errormap_list = []
 
                 for idx, viewpoint in enumerate(config['cameras']):
+                    gt_image = viewpoint.try_load_image(renderArgs[1].device)
+                    if gt_image is None:
+                        continue
                     voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.load_image(image.device), 0.0, 1.0)
+                    gt_image = torch.clamp(gt_image, 0.0, 1.0)
+                    valid_views += 1
                     if tb_writer and (idx < 30):
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
@@ -257,9 +261,12 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
 
                 
                 
-                psnr_test /= len(config['cameras'])
-                l1_test /= len(config['cameras'])          
-                logger.info("\n[ITER {}] Evaluating {}: L1 {} PSNR {}".format(iteration, config['name'], l1_test, psnr_test))
+                if not valid_views:
+                    logger.warning("No decodable images for %s validation; skipping metrics.", config['name'])
+                    continue
+                psnr_test /= valid_views
+                l1_test /= valid_views
+                logger.info("\n[ITER {}] Evaluating {} ({} valid views): L1 {} PSNR {}".format(iteration, config['name'], valid_views, l1_test, psnr_test))
 
                 
                 if tb_writer:
@@ -288,6 +295,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     name_list = []
     per_view_dict = {}
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        gt = view.try_load_image(background.device)
+        if gt is None:
+            continue
         
         torch.cuda.synchronize();t_start = time.time()
         
@@ -304,7 +314,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
         # gts
-        gt = view.load_image(rendering.device)[0:3, :, :]
+        gt = gt[0:3, :, :]
         
         # error maps
         errormap = (rendering - gt).abs()
@@ -315,6 +325,11 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
+
+    for directory in (render_path, error_path, gts_path):
+        for path in Path(directory).glob("*.png"):
+            if path.name not in per_view_dict:
+                path.unlink()
     
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)
@@ -354,7 +369,7 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
 def readImages(renders_dir, gt_dir):
     """Yield one decoded pair at a time, closing files before yielding."""
-    for fname in os.listdir(renders_dir):
+    for fname in sorted(os.listdir(renders_dir)):
         with Image.open(renders_dir / fname) as render:
             render_tensor = tf.to_tensor(render).unsqueeze(0)[:, :3, :, :]
         with Image.open(gt_dir / fname) as gt:
@@ -403,6 +418,10 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
             ssims.append(ssim(rendering, gt))
             psnrs.append(psnr(rendering, gt))
             lpipss.append(lpips_fn(rendering, gt).detach())
+
+        if not image_names:
+            logger.warning("No valid rendered image pairs for %s; skipping metrics.", method)
+            continue
         
         if wandb is not None:
             wandb.log({"test_SSIMS":torch.stack(ssims).mean().item(), })

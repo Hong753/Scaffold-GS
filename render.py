@@ -30,6 +30,7 @@ from utils.general_utils import safe_state
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
+from pathlib import Path
 
 def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
@@ -44,6 +45,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     # debug = 0
     t_list = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
+        gt = view.try_load_image(background.device)
+        if gt is None:
+            continue
 
         torch.cuda.synchronize(); t0 = time.time()
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
@@ -53,10 +57,16 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         t_list.append(t1-t0)
 
         rendering = render_pkg["render"]
-        gt = view.load_image(rendering.device)[0:3, :, :]
+        gt = gt[0:3, :, :]
         name_list.append('{0:05d}'.format(idx) + ".png")
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+
+    valid_names = set(name_list)
+    for directory in (render_path, gts_path):
+        for path in Path(directory).glob("*.png"):
+            if path.name not in valid_names:
+                path.unlink()
 
     t = np.array(t_list[5:])
     fps = 1.0 / t.mean()

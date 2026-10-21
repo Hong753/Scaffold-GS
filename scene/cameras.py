@@ -13,7 +13,7 @@ import torch
 from torch import nn
 import numpy as np
 from utils.graphics_utils import getWorld2View2, getProjectionMatrix
-from utils.image_loading import load_image_tensor
+from utils.image_loading import CorruptImageError, load_image_tensor, warn_corrupt_image
 
 class Camera(nn.Module):
     def __init__(self, colmap_id, R, T, FoVx, FoVy, image, gt_alpha_mask,
@@ -40,6 +40,7 @@ class Camera(nn.Module):
 
         self.image_path = image_path
         self.image_options = image_options or {}
+        self.image_invalid = False
         self._image = None
         if image_path is not None:
             if image_resolution is None:
@@ -77,6 +78,17 @@ class Camera(nn.Module):
         image = load_image_tensor(
             self.image_path, (self.image_width, self.image_height), self.image_options)
         return image.to(target)
+
+    def try_load_image(self, device=None):
+        """Skip a corrupt view for the rest of this run; never cache pixels."""
+        if self.image_invalid:
+            return None
+        try:
+            return self.load_image(device)
+        except CorruptImageError as error:
+            self.image_invalid = True
+            warn_corrupt_image(error)
+            return None
 
     @property
     def original_image(self):

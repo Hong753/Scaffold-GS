@@ -160,10 +160,13 @@ view to the render device; validation, rendering and metrics also process one
 view or image pair at a time. `--data_device` controls the default target device
 for explicitly loading an image, rather than preloading the dataset.
 
-If Pillow reports a truncated image, the selected image is retried with its
-truncation recovery enabled. A warning identifies the source path once per run;
-some pixels may be missing or corrupted, so replace or re-export that image. Other
-decode errors, including failed recovery, report the image path and stop the run.
+Truncated or undecodable images are skipped, with a warning naming each source
+path once per run. Training selects another camera within the same optimization
+step and excludes known corrupt views from subsequent sampling. Validation and
+rendering also skip those views, and validation averages use only valid images.
+Decoding remains strict: partial images are never used as training targets.
+Permission and filesystem errors still stop the run. If no valid training views
+remain, training stops with a clear error. No image pixels are cached.
 
 For training a single scene, modify the path and configurations in ```single_train.sh``` accordingly and run it:
 

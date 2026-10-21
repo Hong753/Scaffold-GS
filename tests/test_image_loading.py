@@ -6,6 +6,7 @@ import io
 import json
 import os
 import sys
+import time
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import NamedTuple
@@ -18,9 +19,10 @@ from PIL import Image, ImageFile
 
 from utils.general_utils import PILtoTorch
 from utils.graphics_utils import focal2fov, fov2focal
-from utils.image_loading import load_image_tensor
+from utils.image_loading import (CorruptImageError, load_image_tensor, open_image,
+                                 sample_training_camera, warn_corrupt_image)
 from utils.image_utils import psnr
-from utils.loss_utils import ssim
+from utils.loss_utils import l1_loss, ssim
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -91,15 +93,11 @@ def jpeg_bytes():
     return stream.getvalue()
 
 
-def test_truncated_selected_image_recovers_without_caching(camera_utils, monkeypatch, tmp_path):
+@pytest.mark.parametrize("recovery_setting", [False, True])
+def test_truncated_selected_image_is_strictly_rejected(monkeypatch, tmp_path, recovery_setting):
     path = tmp_path / "truncated.jpg"
     path.write_bytes(jpeg_bytes()[:-32])
-    monkeypatch.setattr(ImageFile, "LOAD_TRUNCATED_IMAGES", False)
-    with Image.open(path) as source, pytest.raises(OSError, match="truncated"):
-        source.load()
-
-    args = SimpleNamespace(resolution=2, data_device="cpu")
-    camera = camera_utils.loadCam(args, 0, camera_info(path), 1.0)
+    monkeypatch.setattr(ImageFile, "LOAD_TRUNCATED_IMAGES", recovery_setting)
     opened = []
     original_open = Image.open
 
@@ -109,26 +107,77 @@ def test_truncated_selected_image_recovers_without_caching(camera_utils, monkeyp
         return image
 
     monkeypatch.setattr(Image, "open", track_open)
-    with pytest.warns(RuntimeWarning, match="Recovered truncated image") as messages:
-        selected = camera.load_image("cpu")
-    assert str(path) in str(messages[0].message)
-    assert selected.shape == (3, 24, 32) and torch.isfinite(selected).all()
-    assert 0 <= selected.min() <= selected.max() <= 1
+    with pytest.raises(CorruptImageError, match="truncated") as failure:
+        load_image_tensor(path, (32, 24))
+    assert str(path) in str(failure.value)
     assert opened and all(image.fp is None for image in opened)
-    assert not ImageFile.LOAD_TRUNCATED_IMAGES
+    assert ImageFile.LOAD_TRUNCATED_IMAGES == recovery_setting
 
+
+def test_corrupt_camera_is_skipped_once(camera_utils, monkeypatch, tmp_path):
+    path = tmp_path / "truncated.jpg"
+    path.write_bytes(jpeg_bytes()[:-32])
+    camera = camera_utils.loadCam(SimpleNamespace(resolution=1, data_device="cpu"),
+                                  0, camera_info(path), 1.0)
+    with pytest.warns(RuntimeWarning, match="Skipping corrupt image") as messages:
+        assert camera.try_load_image("cpu") is None
+    assert str(path) in str(messages[0].message)
+    assert camera.image_invalid and camera._image is None
+
+    def unexpected_decode(*args, **kwargs):
+        raise AssertionError("Known corrupt image was decoded again")
+
+    monkeypatch.setattr(Image.Image, "load", unexpected_decode)
     with warnings.catch_warnings(record=True) as messages:
         warnings.simplefilter("always")
-        torch.testing.assert_close(camera.load_image("cpu"), selected)
+        assert camera.try_load_image("cpu") is None
     assert not messages
 
-    # Recovery never caches image pixels: repairing the source is visible on
-    # the very next selection, with no restart or camera reconstruction.
-    Image.new("RGB", (64, 48), (0, 255, 0)).save(path, format="PNG")
-    repaired = camera.load_image("cpu")
-    assert repaired[1].eq(1).all() and repaired[[0, 2]].eq(0).all()
-    assert camera._image is None
-    assert not ImageFile.LOAD_TRUNCATED_IMAGES
+
+def test_training_sampler_replaces_corrupt_view_within_step(camera_utils, monkeypatch, tmp_path):
+    bad_path, good_path = tmp_path / "bad.jpg", tmp_path / "good.png"
+    bad_path.write_bytes(jpeg_bytes()[:-32])
+    Image.new("RGB", (64, 48), (0, 255, 0)).save(good_path)
+    args = SimpleNamespace(resolution=1, data_device="cpu")
+    cameras = [camera_utils.loadCam(args, index, camera_info(path), 1.0)
+               for index, path in enumerate([bad_path, good_path])]
+    monkeypatch.setattr("utils.image_loading.randrange", lambda size: 0)
+    with pytest.warns(RuntimeWarning, match="Skipping corrupt image"):
+        selected, image, stack = sample_training_camera(cameras, None, "cpu")
+    assert selected is cameras[1]
+    assert image[1].eq(1).all() and image[[0, 2]].eq(0).all()
+    assert cameras[0].image_invalid
+    for _ in range(3):
+        selected, _, stack = sample_training_camera(cameras, stack, "cpu")
+        assert selected is cameras[1]
+    assert all(camera._image is None for camera in cameras)
+
+
+def test_training_stops_when_all_views_are_corrupt(camera_utils, tmp_path):
+    path = tmp_path / "bad.jpg"
+    path.write_bytes(jpeg_bytes()[:-32])
+    camera = camera_utils.loadCam(SimpleNamespace(resolution=1, data_device="cpu"),
+                                  0, camera_info(path), 1.0)
+    with pytest.warns(RuntimeWarning, match="Skipping corrupt image"), \
+            pytest.raises(RuntimeError, match="No decodable training images"):
+        sample_training_camera([camera], None, "cpu")
+
+
+def test_corrupt_header_is_skipped_without_decoding_other_views(camera_utils, monkeypatch, tmp_path):
+    bad_path, good_path = tmp_path / "bad.jpg", tmp_path / "good.png"
+    bad_path.write_bytes(jpeg_bytes()[:100])
+    Image.new("RGB", (64, 48)).save(good_path)
+
+    def unexpected_decode(*args, **kwargs):
+        raise AssertionError("Camera construction decoded image pixels")
+
+    monkeypatch.setattr(Image.Image, "load", unexpected_decode)
+    args = SimpleNamespace(resolution=1, data_device="cpu")
+    with pytest.warns(RuntimeWarning, match="Skipping corrupt image"):
+        cameras = camera_utils.cameraList_from_camInfos(
+            [camera_info(bad_path), camera_info(good_path)], 1.0, args)
+    assert len(cameras) == 1 and cameras[0].image_path == str(good_path)
+    assert cameras[0]._image is None
 
 
 @pytest.mark.parametrize("data", [b"not an image", jpeg_bytes()[:100]])
@@ -136,11 +185,25 @@ def test_unrecoverable_image_reports_path_and_restores_pillow(monkeypatch, tmp_p
     path = tmp_path / "broken.jpg"
     path.write_bytes(data)
     monkeypatch.setattr(ImageFile, "LOAD_TRUNCATED_IMAGES", False)
-    with pytest.raises(OSError, match="Could not load camera image") as failure:
+    with pytest.raises(CorruptImageError, match="Could not decode camera image") as failure:
         load_image_tensor(path, (32, 24))
     assert str(path) in str(failure.value)
     assert isinstance(failure.value.__cause__, OSError)
     assert not ImageFile.LOAD_TRUNCATED_IMAGES
+
+
+def test_filesystem_errors_are_not_classified_as_corruption(monkeypatch, tmp_path):
+    with pytest.raises(FileNotFoundError):
+        load_image_tensor(tmp_path / "missing.png", (32, 24))
+
+    def denied(*args, **kwargs):
+        raise PermissionError(13, "Permission denied")
+
+    monkeypatch.setattr(Image, "open", denied)
+    with pytest.raises(PermissionError) as failure:
+        load_image_tensor(tmp_path / "unreadable.png", (32, 24))
+    assert not isinstance(failure.value, CorruptImageError)
+    assert "unreadable.png" in str(failure.value)
 
 
 @pytest.mark.parametrize("background", [None, [0, 0, 0], [1, 1, 1]])
@@ -196,6 +259,92 @@ class QuietProgress:
         pass
 
 
+def source_function(filename, name, namespace):
+    source = ast.parse((ROOT / filename).read_text())
+    node = next(node for node in source.body if isinstance(node, ast.FunctionDef) and node.name == name)
+    exec(compile(ast.Module(body=[node], type_ignores=[]), filename, "exec"), namespace)
+    return namespace[name]
+
+
+@pytest.mark.parametrize("all_test_views_bad", [False, True])
+def test_validation_uses_only_valid_views(camera_utils, tmp_path, all_test_views_bad):
+    bad_path, good_path = tmp_path / "bad.jpg", tmp_path / "good.png"
+    bad_path.write_bytes(jpeg_bytes()[:-32])
+    Image.new("RGB", (64, 48), (128, 128, 128)).save(good_path)
+    args = SimpleNamespace(resolution=1, data_device="cpu")
+    bad, good = [camera_utils.loadCam(args, index, camera_info(path), 1.0)
+                 for index, path in enumerate([bad_path, good_path])]
+    test_cameras = [bad] if all_test_views_bad else [bad, good]
+    scene = SimpleNamespace(gaussians=torch.nn.Module(), getTestCameras=lambda: test_cameras,
+                            getTrainCameras=lambda: [good])
+    infos, notices, rendered = [], [], []
+    logger = SimpleNamespace(info=infos.append,
+                             warning=lambda message, *args: notices.append(message % args))
+
+    def render_valid(camera, *args, **kwargs):
+        assert camera is good
+        rendered.append(camera)
+        return {"render": torch.zeros(3, 48, 64)}
+
+    namespace = dict(torch=torch, Scene=object, psnr=psnr, prefilter_voxel=lambda *args: None)
+    report = source_function("train.py", "training_report", namespace)
+    with pytest.warns(RuntimeWarning, match="Skipping corrupt image"):
+        report(None, "scene", 1, torch.tensor(0.), torch.tensor(0.), l1_loss, 0., [1],
+               scene, render_valid, (None, torch.zeros(3)), logger=logger)
+    if all_test_views_bad:
+        assert notices and "No decodable images" in notices[0]
+        assert not any("Evaluating test" in message for message in infos)
+        assert len(rendered) == 5
+    else:
+        summary = next(message for message in infos if "Evaluating test" in message)
+        assert "1 valid views" in summary
+        assert float(summary.split(" L1 ")[1].split(" PSNR ")[0]) == pytest.approx(128 / 255)
+        assert len(rendered) == 6
+    assert scene.gaussians.training
+
+
+@pytest.mark.parametrize("filename", ["train.py", "render.py"])
+def test_render_skips_corrupt_views_and_removes_stale_outputs(filename, camera_utils, monkeypatch, tmp_path):
+    bad_path, good_path = tmp_path / "bad.jpg", tmp_path / "good.png"
+    bad_path.write_bytes(jpeg_bytes()[:-32])
+    Image.new("RGB", (64, 48), (128, 128, 128)).save(good_path)
+    args = SimpleNamespace(resolution=1, data_device="cpu")
+    paths = [bad_path] + [good_path] * 6
+    cameras = [camera_utils.loadCam(args, index, camera_info(path), 1.0)
+               for index, path in enumerate(paths)]
+    output = tmp_path / "test/ours_1"
+    for directory in ["renders", "gt", "errors"]:
+        (output / directory).mkdir(parents=True)
+        (output / directory / "00000.png").write_bytes(b"stale recovered output")
+        (output / directory / "99999.png").write_bytes(b"orphaned output")
+    rendered = []
+
+    def render_valid(camera, *args, **kwargs):
+        assert camera is not cameras[0]
+        rendered.append(camera)
+        return {"render": torch.zeros(3, 48, 64), "radii": torch.ones(2)}
+
+    def save_image(tensor, path):
+        pixels = (tensor.permute(1, 2, 0).numpy() * 255).astype(np.uint8)
+        Image.fromarray(pixels).save(path)
+
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: None)
+    namespace = dict(os=os, torch=torch, time=time, np=np, Path=Path, json=json,
+                     makedirs=os.makedirs, tqdm=QuietProgress, render=render_valid,
+                     prefilter_voxel=lambda *args: None,
+                     torchvision=SimpleNamespace(utils=SimpleNamespace(save_image=save_image)))
+    render_set = source_function(filename, "render_set", namespace)
+    with pytest.warns(RuntimeWarning, match="Skipping corrupt image"):
+        render_set(str(tmp_path), "test", 1, cameras, None, None, torch.zeros(3))
+    assert len(rendered) == 6
+    expected = {f"{index:05d}.png" for index in range(1, 7)}
+    assert {path.name for path in (output / "renders").iterdir()} == expected
+    assert {path.name for path in (output / "gt").iterdir()} == expected
+    if filename == "train.py":
+        assert {path.name for path in (output / "errors").iterdir()} == expected
+        assert json.loads((output / "per_view_count.json").read_text()) == {name: 2.0 for name in expected}
+
+
 def test_synthetic_reader_retains_paths_and_preprocessing_only(monkeypatch, tmp_path):
     path = tmp_path / "frame.png"
     Image.new("RGBA", (24, 16), (90, 130, 180, 128)).save(path)
@@ -210,7 +359,8 @@ def test_synthetic_reader_retains_paths_and_preprocessing_only(monkeypatch, tmp_
              and node.name in {"CameraInfo", "readCamerasFromTransforms"}]
     namespace = dict(os=os, np=np, json=json, Path=Path, Image=Image, NamedTuple=NamedTuple,
                      tqdm=QuietProgress, Fore=SimpleNamespace(YELLOW=""), Style=SimpleNamespace(RESET_ALL=""),
-                     focal2fov=focal2fov, fov2focal=fov2focal)
+                     focal2fov=focal2fov, fov2focal=fov2focal, open_image=open_image,
+                     CorruptImageError=CorruptImageError, warn_corrupt_image=warn_corrupt_image)
     exec(compile(ast.Module(body=nodes, type_ignores=[]), "<synthetic metadata>", "exec"), namespace)
 
     def unexpected_decode(*args, **kwargs):
@@ -286,6 +436,19 @@ def test_metrics_stream_pairs_and_preserve_results(filename, monkeypatch, tmp_pa
     result = json.loads((tmp_path / "results.json").read_text())["ours_1"]
     np.testing.assert_allclose([result[key] for key in ["SSIM", "PSNR", "LPIPS"]],
                                np.mean(expected, axis=0), rtol=1e-5)
+
+
+@pytest.mark.parametrize("filename", ["train.py", "metrics.py"])
+def test_metrics_do_not_report_values_when_no_valid_views_remain(filename, tmp_path):
+    (tmp_path / "test/ours_1/renders").mkdir(parents=True)
+    (tmp_path / "test/ours_1/gt").mkdir()
+    namespace = metric_namespace(filename)
+    if filename == "train.py":
+        namespace["evaluate"](str(tmp_path), visible_count=[],
+                              logger=SimpleNamespace(warning=lambda *args: None))
+    else:
+        namespace["evaluate"]([str(tmp_path)])
+    assert json.loads((tmp_path / "results.json").read_text()) == {"ours_1": {}}
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is unavailable")
