@@ -16,12 +16,16 @@ from torch_scatter import scatter_max
 from utils.general_utils import inverse_sigmoid, get_expon_lr_func
 from torch import nn
 import os
+import tempfile
+from types import SimpleNamespace
 from utils.system_utils import mkdir_p
 from plyfile import PlyData, PlyElement
 from simple_knn._C import distCUDA2
 from utils.graphics_utils import BasicPointCloud
 from utils.general_utils import strip_symmetric, build_scaling_rotation
 from scene.embedding import Embedding
+from utils.neural_gaussians import generate_neural_gaussians
+from utils.sh_utils import RGB2SH
 
     
 class GaussianModel:
@@ -93,6 +97,7 @@ class GaussianModel:
         self.optimizer = None
         self.percent_dense = 0
         self.spatial_lr_scale = 0
+        self._ply_export_camera = None
         self.setup_functions()
 
         if self.use_feat_bank:
@@ -400,8 +405,101 @@ class GaussianModel:
             l.append('rot_{}'.format(i))
         return l
 
-    def save_ply(self, path):
-        mkdir_p(os.path.dirname(path))
+    @torch.no_grad()
+    def save_ply(self, path, viewpoint_camera=None, chunk_size=65536):
+        """Bake child Gaussians into a standard, SH-degree-0 3DGS PLY.
+
+        Scene supplies a fixed training camera. Standalone calls can pass one;
+        otherwise a camera outside the anchor bounds and appearance UID 0 are
+        used. All anchors are decoded, including those outside its frustum.
+        View-dependent color, opacity, scale and rotation are frozen at export.
+        Native anchor checkpoints are written separately by save_anchor_ply().
+        """
+        if chunk_size <= 0:
+            raise ValueError("chunk_size must be positive")
+        path = os.fspath(path)
+        directory = os.path.dirname(path) or "."
+        mkdir_p(directory)
+        anchor = self.get_anchor
+        camera = viewpoint_camera if viewpoint_camera is not None else self._ply_export_camera
+        if camera is None:
+            if anchor.shape[0]:
+                lower, upper = anchor.amin(dim=0), anchor.amax(dim=0)
+                center = (lower + upper) / 2
+                center = center.clone()
+                center[2] = upper[2] + (upper - lower).norm().clamp_min(1.0)
+            else:
+                center = anchor.new_tensor([0.0, 0.0, 1.0])
+            camera = SimpleNamespace(camera_center=center, uid=0)
+        camera = SimpleNamespace(
+            camera_center=torch.as_tensor(camera.camera_center, device=anchor.device, dtype=anchor.dtype),
+            uid=int(getattr(camera, "uid", 0)),
+        )
+
+        modules = [self.mlp_opacity, self.mlp_cov, self.mlp_color]
+        if self.use_feat_bank:
+            modules.append(self.mlp_feature_bank)
+        if self.appearance_dim > 0:
+            modules.append(self.embedding_appearance)
+        modes = [module.training for module in modules]
+        names = ["x", "y", "z", "nx", "ny", "nz", "f_dc_0", "f_dc_1", "f_dc_2",
+                 "opacity", "scale_0", "scale_1", "scale_2", "rot_0", "rot_1", "rot_2", "rot_3"]
+        dtype = np.dtype([(name, "<f4") for name in names])
+        temporary_path = None
+        count = 0
+        try:
+            for module in modules:
+                module.eval()
+            # Stream chunks to a temporary file; patch the fixed-width count
+            # before atomically replacing the destination. CPU and GPU memory
+            # stay bounded by chunk_size rather than the full child count.
+            with tempfile.NamedTemporaryFile(mode="w+b", dir=directory, delete=False) as stream:
+                temporary_path = stream.name
+                stream.write(b"ply\nformat binary_little_endian 1.0\n")
+                stream.write(b"comment Scaffold-GS baked child Gaussians; SH degree 0\n")
+                stream.write(("comment reference_camera_uid {}\n".format(camera.uid)).encode("ascii"))
+                stream.write(b"element vertex ")
+                count_position = stream.tell()
+                # PlayCanvas splits header lines on a literal single space;
+                # zero padding keeps the count field contiguous while seeking.
+                stream.write(("{:020d}\n".format(0)).encode("ascii"))
+                for name in names:
+                    stream.write(("property float {}\n".format(name)).encode("ascii"))
+                stream.write(b"end_header\n")
+                for start in range(0, anchor.shape[0], chunk_size):
+                    indices = torch.arange(start, min(start + chunk_size, anchor.shape[0]), device=anchor.device)
+                    xyz, color, opacity, scaling, rotation = generate_neural_gaussians(
+                        camera, self, visible_mask=indices, is_training=False)
+                    opacity = opacity.clamp(1e-6, 1.0 - 1e-6)
+                    rotation = rotation.clone()
+                    zero_rotation = rotation.norm(dim=1) < 1e-12
+                    rotation[zero_rotation] = rotation.new_tensor([1.0, 0.0, 0.0, 0.0])
+                    attributes = torch.cat((
+                        xyz, torch.zeros_like(xyz), RGB2SH(color),
+                        torch.log(opacity) - torch.log1p(-opacity),
+                        torch.log(scaling.clamp_min(torch.finfo(scaling.dtype).tiny)), rotation,
+                    ), dim=1).float().cpu().numpy()
+                    if not np.isfinite(attributes).all():
+                        raise ValueError("Non-finite Gaussian attributes while exporting {}".format(path))
+                    elements = np.empty(attributes.shape[0], dtype=dtype)
+                    for column, name in enumerate(names):
+                        elements[name] = attributes[:, column]
+                    stream.write(elements.tobytes())
+                    count += elements.shape[0]
+                stream.seek(count_position)
+                stream.write(("{:020d}".format(count)).encode("ascii"))
+            os.replace(temporary_path, path)
+            temporary_path = None
+        finally:
+            for module, training in zip(modules, modes):
+                module.train(training)
+            if temporary_path is not None:
+                os.unlink(temporary_path)
+        return count
+
+    def save_anchor_ply(self, path):
+        """Save native Scaffold-GS anchors/features for loading and rendering."""
+        mkdir_p(os.path.dirname(os.fspath(path)) or ".")
 
         anchor = self._anchor.detach().cpu().numpy()
         normals = np.zeros_like(anchor)
@@ -415,12 +513,21 @@ class GaussianModel:
 
         elements = np.empty(anchor.shape[0], dtype=dtype_full)
         attributes = np.concatenate((anchor, normals, offset, anchor_feat, opacities, scale, rotation), axis=1)
-        elements[:] = list(map(tuple, attributes))
+        for column, name in enumerate(elements.dtype.names):
+            elements[name] = attributes[:, column]
         el = PlyElement.describe(elements, 'vertex')
         PlyData([el]).write(path)
 
     def load_ply_sparse_gaussian(self, path):
+        # New saves keep the native representation beside the viewer PLY.
+        # Legacy anchor-only point_cloud.ply files still load directly.
+        native_path = os.path.splitext(os.fspath(path))[0] + "_scaffold.ply"
+        if os.path.isfile(native_path):
+            path = native_path
         plydata = PlyData.read(path)
+        properties = {p.name for p in plydata.elements[0].properties}
+        if "f_anchor_feat_0" not in properties or "f_offset_0" not in properties:
+            raise ValueError("This is a baked Gaussian PLY; loading Scaffold-GS requires its _scaffold.ply checkpoint")
 
         anchor = np.stack((np.asarray(plydata.elements[0]["x"]),
                         np.asarray(plydata.elements[0]["y"]),

@@ -94,9 +94,15 @@ class Scene:
         else:
             self.gaussians.create_from_pcd(scene_info.point_cloud, self.cameras_extent)
 
+        # Pick by image name so camera shuffling cannot change the baked view.
+        cameras = next(iter(self.train_cameras.values()))
+        if cameras:
+            self.gaussians._ply_export_camera = min(cameras, key=lambda camera: camera.image_name)
+
     def save(self, iteration):
         point_cloud_path = os.path.join(self.model_path, "point_cloud/iteration_{}".format(iteration))
         self.gaussians.save_ply(os.path.join(point_cloud_path, "point_cloud.ply"))
+        self.gaussians.save_anchor_ply(os.path.join(point_cloud_path, "point_cloud_scaffold.ply"))
         self.gaussians.save_mlp_checkpoints(point_cloud_path)
 
     def getTrainCameras(self, scale=1.0):

@@ -154,6 +154,40 @@ This script will store the log (with running-time code) into ```outputs/dataset_
 
 
 
+### SuperSplat-compatible PLY saving
+
+Training saves at **7,000 and 30,000 iterations** by default (and at the final
+iteration if a different training length is selected). Override these with
+`--save_iterations` when needed.
+
+Open either of these files directly in SuperSplat:
+
+```text
+<model_path>/point_cloud/iteration_7000/point_cloud.ply
+<model_path>/point_cloud/iteration_30000/point_cloud.ply
+```
+
+`GaussianModel.save_ply(path)` now expands anchors into their child Gaussians,
+evaluates the neural decoders, and writes a binary little-endian standard 3DGS
+PLY with SH-degree-0 color, logit opacity, log scale and quaternion rotation.
+The reference is the training camera with the alphabetically first image name.
+All anchors are evaluated in chunks, without camera-frustum filtering; children
+with non-positive predicted opacity are omitted, as in the native renderer.
+Color, opacity, scale and rotation are baked for that camera and remain fixed
+when navigating in SuperSplat.
+
+For a different bake, call
+`gaussians.save_ply(path, viewpoint_camera=camera, chunk_size=65536)`.
+Outside a `Scene`, a call without a camera uses a synthetic camera beyond the
+anchor bounds and appearance UID 0. A trained model and its MLPs must be loaded
+before export.
+
+Each training save also keeps `point_cloud_scaffold.ply` and the MLP checkpoints
+for native Scaffold-GS loading. The Python loader automatically selects this
+native sidecar when given `point_cloud.ply`; legacy anchor-only checkpoints are
+still supported. Keep these files together for subsequent native rendering.
+`save_anchor_ply(path)` explicitly writes the original anchor representation.
+
 ## Evaluation
 
 We've integrated the rendering and metrics calculation process into the training code. So, when completing training, the ```rendering results```, ```fps``` and ```quality metrics``` will be printed automatically. And the rendering results will be save in the log dir. Mind that the ```fps``` is roughly estimated by 
