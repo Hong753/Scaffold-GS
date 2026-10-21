@@ -43,6 +43,7 @@ class CameraInfo(NamedTuple):
     image_name: str
     width: int
     height: int
+    image_options: dict = None
 
 class SceneInfo(NamedTuple):
     point_cloud: BasicPointCloud
@@ -108,8 +109,7 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        # Load pixels in loadCam(), where the file is closed after decoding.
-        # Keeping a lazy PIL image here retains one open file per camera.
+        # Retain metadata only; Camera.load_image() reads the selected view.
         image = None
 
         # print(f'image: {image.size}')
@@ -270,39 +270,33 @@ def readCamerasFromTransforms(path, transformsfile, white_background, extension=
 
             image_path = os.path.join(path, cam_name)
             image_name = Path(cam_name).stem
-            image = Image.open(image_path)
+            with Image.open(image_path) as source:
+                image_width, image_height = source.size
 
             if undistorted:
-                mtx = np.array(
-                    [
+                image_options = {"undistortion": {
+                    "matrix": [
                         [frame["fl_x"], 0, frame["cx"]],
                         [0, frame["fl_y"], frame["cy"]],
                         [0, 0, 1.0],
                     ],
-                    dtype=np.float32,
-                )
-                dist = np.array([frame["k1"], frame["k2"], frame["p1"], frame["p2"], frame["k3"]], dtype=np.float32)
-                im_data = np.array(image.convert("RGB"))
-                arr = cv2.undistort(im_data / 255.0, mtx, dist, None, mtx)
-                image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+                    "distortion": [frame["k1"], frame["k2"], frame["p1"], frame["p2"], frame["k3"]],
+                }}
             else:
-                im_data = np.array(image.convert("RGBA"))
-                bg = np.array([1,1,1]) if white_background else np.array([0, 0, 0])
-                norm_data = im_data / 255.0
-                arr = norm_data[:,:,:3] * norm_data[:, :, 3:4] + bg * (1 - norm_data[:, :, 3:4])
-                image = Image.fromarray(np.array(arr*255.0, dtype=np.byte), "RGB")
+                image_options = {"background": [1, 1, 1] if white_background else [0, 0, 0]}
 
             if fovx is not None:
-                fovy = focal2fov(fov2focal(fovx, image.size[0]), image.size[1])
+                fovy = focal2fov(fov2focal(fovx, image_width), image_height)
                 FovY = fovy 
                 FovX = fovx
             else:
                 # given focal in pixel unit
-                FovY = focal2fov(frame["fl_y"], image.size[1])
-                FovX = focal2fov(frame["fl_x"], image.size[0])
+                FovY = focal2fov(frame["fl_y"], image_height)
+                FovX = focal2fov(frame["fl_x"], image_width)
 
-            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                            image_path=image_path, image_name=image_name, width=image.size[0], height=image.size[1]))
+            cam_infos.append(CameraInfo(uid=idx, R=R, T=T, FovY=FovY, FovX=FovX, image=None,
+                            image_path=image_path, image_name=image_name, width=image_width, height=image_height,
+                            image_options=image_options))
             
             if is_debug and idx > 50:
                 break

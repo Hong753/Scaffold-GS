@@ -153,6 +153,13 @@ bash train_xxx.sh
 
 ### Training a single scene
 
+Camera images are loaded **from disk on demand** by default. Cameras retain
+image paths, output dimensions and preprocessing metadata, without caching
+decoded images in CPU RAM or CUDA memory. Training transfers only the selected
+view to the render device; validation, rendering and metrics also process one
+view or image pair at a time. `--data_device` controls the default target device
+for explicitly loading an image, rather than preloading the dataset.
+
 For training a single scene, modify the path and configurations in ```single_train.sh``` accordingly and run it:
 
 ```

@@ -136,7 +136,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
-        gt_image = viewpoint_cam.original_image.cuda()
+        gt_image = viewpoint_cam.load_image(image.device)
         Ll1 = l1_loss(image, gt_image)
 
         ssim_loss = (1.0 - ssim(image, gt_image))
@@ -144,6 +144,7 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
         loss.backward()
+        del gt_image
         
         iter_end.record()
 
@@ -237,7 +238,7 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                 for idx, viewpoint in enumerate(config['cameras']):
                     voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
-                    gt_image = torch.clamp(viewpoint.original_image.to("cuda"), 0.0, 1.0)
+                    gt_image = torch.clamp(viewpoint.load_image(image.device), 0.0, 1.0)
                     if tb_writer and (idx < 30):
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/render".format(viewpoint.image_name), image[None], global_step=iteration)
                         tb_writer.add_images(f'{dataset_name}/'+config['name'] + "_view_{}/errormap".format(viewpoint.image_name), (gt_image[None]-image[None]).abs(), global_step=iteration)
@@ -303,7 +304,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
         # gts
-        gt = view.original_image[0:3, :, :]
+        gt = view.load_image(rendering.device)[0:3, :, :]
         
         # error maps
         errormap = (rendering - gt).abs()
@@ -352,18 +353,15 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
 
 
 def readImages(renders_dir, gt_dir):
-    renders = []
-    gts = []
-    image_names = []
+    """Yield one decoded pair at a time, closing files before yielding."""
     for fname in os.listdir(renders_dir):
-        render = Image.open(renders_dir / fname)
-        gt = Image.open(gt_dir / fname)
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
-        image_names.append(fname)
-    return renders, gts, image_names
+        with Image.open(renders_dir / fname) as render:
+            render_tensor = tf.to_tensor(render).unsqueeze(0)[:, :3, :, :]
+        with Image.open(gt_dir / fname) as gt:
+            gt_tensor = tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :]
+        yield fname, render_tensor, gt_tensor
 
-
+@torch.no_grad()
 def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None):
 
     full_dict = {}
@@ -390,16 +388,21 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
         method_dir = test_dir / method
         gt_dir = method_dir/ "gt"
         renders_dir = method_dir / "renders"
-        renders, gts, image_names = readImages(renders_dir, gt_dir)
+        image_names = []
+        metric_device = next(lpips_fn.parameters()).device
 
         ssims = []
         psnrs = []
         lpipss = []
 
-        for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-            ssims.append(ssim(renders[idx], gts[idx]))
-            psnrs.append(psnr(renders[idx], gts[idx]))
-            lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
+        for image_name, rendering, gt in tqdm(readImages(renders_dir, gt_dir),
+                                             total=len(os.listdir(renders_dir)), desc="Metric evaluation progress"):
+            image_names.append(image_name)
+            rendering = rendering.to(metric_device)
+            gt = gt.to(metric_device)
+            ssims.append(ssim(rendering, gt))
+            psnrs.append(psnr(rendering, gt))
+            lpipss.append(lpips_fn(rendering, gt).detach())
         
         if wandb is not None:
             wandb.log({"test_SSIMS":torch.stack(ssims).mean().item(), })
