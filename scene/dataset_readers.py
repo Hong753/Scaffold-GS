@@ -108,7 +108,9 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
 
         image_path = os.path.join(images_folder, os.path.basename(extr.name))
         image_name = os.path.basename(image_path).split(".")[0]
-        image = Image.open(image_path)
+        # Load pixels in loadCam(), where the file is closed after decoding.
+        # Keeping a lazy PIL image here retains one open file per camera.
+        image = None
 
         # print(f'image: {image.size}')
 
