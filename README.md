@@ -5,6 +5,22 @@
 
 [[`Project Page`](https://city-super.github.io/scaffold-gs/)][[`arxiv`](https://arxiv.org/abs/2312.00109)][[`Viewer`](https://drive.google.com/file/d/17nPVnRRxO4zMQJ_fKHm13HzvD0wUZ8XF/view?usp=sharing)]
 
+## Setup Environment
+Create environment (Linux-x86_64):
+```bash
+conda create --name scaffoldgs python=3.12 -y
+conda activate scaffoldgs
+
+# Optional
+conda install spyder -y
+
+pip install torch==2.7.0 torchvision==0.22.0 --index-url https://download.pytorch.org/whl/cu128
+pip install torch-scatter -f https://data.pyg.org/whl/torch-2.7.0+cu128.html
+pip install -r requirements.txt
+pip install --no-build-isolation git+https://github.com/camenduru/simple-knn
+pip install --no-build-isolation submodules/diff-gaussian-rasterization
+```
+
 ## News
 
 **[2024.09.25]** 🎈We propose **Octree-AnyGS**, a general anchor-based framework that supports explicit Gaussians (2D-GS, 3D-GS) and neural Gaussians (Scaffold-GS). Additionally, **Octree-GS** has been adapted to the aforementioned Gaussian primitives, enabling Level-of-Detail representation for large-scale scenes. This framework holds potential for application to other Gaussian-based methods, with relevant SIBR visualizations forthcoming.(https://github.com/city-super/Octree-AnyGS)

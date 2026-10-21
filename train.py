@@ -23,7 +23,6 @@ os.system('echo $CUDA_VISIBLE_DEVICES')
 import torch
 import torchvision
 import json
-import wandb
 import time
 from os import makedirs
 import shutil, pathlib
@@ -500,18 +499,7 @@ if __name__ == "__main__":
     dataset = args.source_path.split('/')[-1]
     exp_name = args.model_path.split('/')[-2]
     
-    if args.use_wandb:
-        wandb.login()
-        run = wandb.init(
-            # Set the project where this run will be logged
-            project=f"Scaffold-GS-{dataset}",
-            name=exp_name,
-            # Track hyperparameters and run metadata
-            settings=wandb.Settings(start_method="fork"),
-            config=vars(args)
-        )
-    else:
-        wandb = None
+    wandb = None
     
     logger.info("Optimizing " + args.model_path)
 
