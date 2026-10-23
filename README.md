@@ -306,6 +306,59 @@ python compare_undistortion.py -o outputs/office_undistortion_ablation --summari
 
 ### Visually audit image / camera alignment
 
+For an **independent image-based check**, including datasets with dummy or
+missing COLMAP feature tracks, run:
+
+```bash
+python pose_geometry_check.py \
+  -s /data/hyejun_dataset/HandHeld/Orange_office_Colmap \
+  -o outputs/office_geometry_check
+```
+
+This CPU-only command extracts fresh SIFT matches from original RGB files.
+It does not require a Gaussian checkpoint, a point cloud, CUDA, or Viser.
+Default sampling uses 48 sequence-wide anchors, local gaps of **1, 5, 15**
+registered images, and up to **96** distant candidate pairs. Half the distant
+budget uses pose proximity and half uses sequence-wide sampling independent
+of pose proximity. Candidate revisits still require actual matching overlap.
+Try `--samples 96` for denser coverage. `-m RUN_DIRECTORY` can replace `-s` to
+read the dataset and image-folder configuration from a saved training run.
+
+The report compares saved-camera **epipolar consistency** with geometry fitted
+independently from the image matches. It is not absolute pose accuracy or
+reprojection against the original 3D cloud. Measurements use the resized,
+undistorted analysis grid, at most 1600 pixels wide by default. Actual image
+sizes are recorded per pair. Descriptor ratio filtering, mutual matches,
+duplicate removal, independent fundamental-matrix RANSAC, and spatial support
+checks reduce false matches; repeated texture, moving people, screens and
+reflections can still contaminate results. Homography-dominated matches are
+marked as ambiguous for 3D pose and excluded from synchronization scoring.
+
+It sweeps **pose offsets from -5 to +5** while keeping the RGB pairs, matches,
+and calibration fixed. Positive offset `+d` means image `i` uses pose `i+d`
+in natural registered-image order, not a time offset in seconds. Four temporal
+blocks separate discovery (blocks 0/2) from validation (blocks 1/3); all shifted
+pose support stays within its block. The offset is chosen only on discovery.
+A candidate must improve both validation blocks, reduce their aggregate
+median by at least 20% and 0.1 px, and fall inside the tested range. At least
+five informative pairs in each split are required. Otherwise the result is
+explicitly unavailable or inconclusive. No offset is automatically applied.
+Missing image files do not collapse sequence gaps or change pose indexing.
+
+Open `outputs/office_geometry_check/index.html`. It includes local/revisit
+statistics, the offset sweep, and full-resolution correspondence previews.
+Cyan numbers identify matched features; orange crosses in the right image
+show the nearest points on epipolar lines predicted by the saved cameras.
+Red lines show their separation. Row/radius error profiles are in
+`results.json`; per-pair numbers are also in `pairs.csv`.
+
+The last line, **SEND THIS FILE**, gives
+`outputs/office_geometry_check_results.zip`. It packages results, selected
+previews, measured correspondences and camera poses for follow-up analysis.
+Images decode one at a time; descriptors are cached on disk with a four-image
+RAM limit. Reruns reuse valid feature caches. Cache files are excluded from
+the ZIP. The command does not change training, poses, calibration or RGB files.
+
 To compute the reprojection numbers automatically and prepare one file to share:
 
 ```bash
