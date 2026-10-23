@@ -151,12 +151,6 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             # Progress bar
             ema_loss_for_log = 0.4 * loss.item() + 0.6 * ema_loss_for_log
 
-            if iteration % 10 == 0:
-                progress_bar.set_postfix({"Loss": f"{ema_loss_for_log:.{7}f}"})
-                progress_bar.update(10)
-            if iteration == opt.iterations:
-                progress_bar.close()
-
             # Log and save
             training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, iter_start.elapsed_time(iter_end), testing_iterations, scene, render, (pipe, background), wandb, logger)
             if (iteration in saving_iterations):
@@ -184,6 +178,16 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
             if (iteration in checkpoint_iterations):
                 logger.info("\n[ITER {}] Saving Checkpoint".format(iteration))
                 torch.save((gaussians.capture(), iteration), scene.model_path + "/chkpnt" + str(iteration) + ".pth")
+
+            if iteration % 10 == 0:
+                progress_bar.set_postfix({
+                    "Loss": f"{ema_loss_for_log:.7f}",
+                    "Anchors": f"{gaussians.get_anchor.shape[0]:,}",
+                    "View splats": f"{radii.shape[0]:,}",
+                })
+                progress_bar.update(10)
+            if iteration == opt.iterations:
+                progress_bar.close()
 
 def prepare_output_and_logger(args):    
     if not args.model_path:

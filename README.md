@@ -225,13 +225,20 @@ This script will store the log (with running-time code) into ```outputs/dataset_
 
 ### Compare on-demand COLMAP undistortion
 
-Undistortion is optional and disabled by default. To enable it for a normal run:
+`single_train.sh` launches the undistorted version by default, under the
+`undistorted` experiment name. It keeps stride 3 and 40k training steps:
 
 ```bash
-bash ./single_train.sh --undistort_images
+bash ./single_train.sh
 # Optional writable cache location (the source dataset is never modified):
 bash ./single_train.sh --undistort_images --undistort_cache_dir /path/to/cache
 ```
+
+The training progress bar shows `Anchors` (the current total, including anchor
+growth/pruning) and `View splats` (positive-opacity child Gaussians decoded for
+the sampled camera, before final rasterizer culling). Each anchor has
+`n_offsets` potential children; the decoded view count varies with the camera.
+Direct `train.py`/`train.sh` calls still require `--undistort_images` to enable it.
 
 Only the selected camera image is decoded. On its first use, its COLMAP lens
 distortion is removed directly at the training resolution and a lossless RGBA
