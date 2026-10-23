@@ -1,0 +1,2 @@
+# Install in the existing scaffoldgs CUDA environment.
+viser==1.1.1

@@ -245,6 +245,12 @@ with non-positive predicted opacity are omitted, as in the native renderer.
 Color, opacity, scale and rotation are baked for that camera and remain fixed
 when navigating in SuperSplat.
 
+This is a **single-view approximation**. Children omitted by the reference
+camera's opacity prediction cannot reappear from another view, and their
+view-dependent shape and color cannot adapt. A file loading successfully in
+SuperSplat does not establish visual parity with Scaffold-GS. Use the native
+browser viewer below to inspect the model with its original neural rendering.
+
 For a different bake, call
 `gaussians.save_ply(path, viewpoint_camera=camera, chunk_size=65536)`.
 Outside a `Scene`, a call without a camera uses a synthetic camera beyond the
@@ -277,6 +283,61 @@ python metrics.py -m <path to trained model> # Compute error metrics on renderin
 ```
 
 ## Viewer
+
+### Native browser viewer
+
+Run the viewer on the CUDA machine that already has the working `scaffoldgs`
+environment and compiled rasterizer:
+
+```bash
+conda activate scaffoldgs
+pip install -r requirements-viewer.txt
+python viewer.py -m "/path/to/trained_run" --gpu 0 --port 8080
+```
+
+Open `http://<gpu-server-ip>:8080` in your browser, or `http://localhost:8080`
+when the browser and viewer run on the same machine. The default host is
+`0.0.0.0`; pass `--host 127.0.0.1` to bind locally. For SSH access, forward the
+port from your desktop:
+
+```bash
+ssh -N -L 8080:127.0.0.1:8080 user@gpu-server
+```
+
+Then open `http://localhost:8080` on that desktop. `-m` is the training output
+folder containing `cfg_args` and `point_cloud/`, not a baked PLY. The latest
+checkpoint is loaded automatically; use `--iteration 40000` to select one.
+
+The viewer calls the **same native CUDA renderer and neural decoders** used for
+Scaffold-GS evaluation. Opacity, color, scale and quaternion are recomputed for
+the current camera. Rendering runs on the server GPU and images stream to the
+browser. The server loads the native anchor PLY and saved MLPs directly, without
+reading the source images or building dataset cameras. Existing trained models
+work without retraining. Keep `cfg_args`, the iteration directory's
+`point_cloud_scaffold.ply`, `opacity_mlp.pt`, `cov_mlp.pt`, and `color_mlp.pt`
+together; models using appearance embeddings or the feature bank also need
+their corresponding `.pt` files. Legacy native `point_cloud.ply` is supported.
+`cameras.json` supplies saved camera presets and `frame_selection.json`, when
+present, maps selected training cameras to their appearance IDs. Without camera
+metadata the viewer starts from a scene overview.
+
+Controls:
+
+- Drag to orbit, right-drag to pan, and use the wheel to zoom.
+- W/A/S/D move the camera, Q/E move down/up, and arrow keys look around.
+- Browse saved camera views, reset the view, fit the scene, or level the horizon.
+- Adjust resolution, background, splat scale and appearance-camera index.
+- Download a full-resolution PNG of the current view.
+
+Moving frames default to an 800-pixel longest side and JPEG transport. Once the
+camera stops, a lossless PNG refreshes the view at up to 1,600 pixels. Adjust
+these limits in the sidebar or with `--moving_resolution` and `--max_resolution`.
+`--fps 15` caps the requested render rate; achieved speed depends on the model,
+GPU and connection. Camera updates are coalesced so inference always starts
+from the newest available pose. This provides navigation and inspection, rather
+than SuperSplat's editing/export tools or a standalone browser-only renderer.
+
+### SIBR viewer
 
 The [viewer](https://github.com/city-super/Scaffold-GS/tree/main/SIBR_viewers) for Scaffold-GS is available now. 
 
