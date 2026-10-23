@@ -64,6 +64,10 @@ class ModelParams(ParamGroup):
         self.frame_selection_stride = 1
         self.frame_selection_max_size = 1024
         self.frame_selection_workers = 4
+        self.undistort_images = False
+        self.undistort_cache_dir = "outputs/undistorted"
+        self.compare_undistortion = False
+        self.comparison_eval_views = 32
         self.eval = False
         self.lod = 0
 

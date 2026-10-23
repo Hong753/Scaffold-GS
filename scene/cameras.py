@@ -70,21 +70,26 @@ class Camera(nn.Module):
         self.full_proj_transform = (self.world_view_transform.unsqueeze(0).bmm(self.projection_matrix.unsqueeze(0))).squeeze(0)
         self.camera_center = self.world_view_transform.inverse()[3, :3]
 
-    def load_image(self, device=None):
+    def load_image(self, device=None, return_mask=False):
         """Load the selected view onto device, without storing pixels on Camera."""
         target = self.data_device if device is None else device
         if self.image_path is None:
-            return self._image.to(target)
+            image = self._image.to(target)
+            return (image, None) if return_mask else image
         image = load_image_tensor(
-            self.image_path, (self.image_width, self.image_height), self.image_options)
+            self.image_path, (self.image_width, self.image_height), self.image_options,
+            return_mask=return_mask)
+        if return_mask:
+            rgb, mask = image
+            return rgb.to(target), mask.to(target) if mask is not None else None
         return image.to(target)
 
-    def try_load_image(self, device=None):
+    def try_load_image(self, device=None, return_mask=False):
         """Skip a corrupt view for the rest of this run; never cache pixels."""
         if self.image_invalid:
             return None
         try:
-            return self.load_image(device)
+            return self.load_image(device, return_mask=return_mask)
         except CorruptImageError as error:
             self.image_invalid = True
             warn_corrupt_image(error)

@@ -79,7 +79,9 @@ def getNerfppNorm(cam_info):
 
     return {"translate": translate, "radius": radius}
 
-def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
+def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder,
+                     undistort_images=False, undistort_cache_dir="outputs/undistorted",
+                     compare_undistortion=False):
     cam_infos = []
     for idx, key in enumerate(cam_extrinsics):
         sys.stdout.write('\r')
@@ -96,8 +98,14 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         R = np.transpose(qvec2rotmat(extr.qvec))
         T = np.array(extr.tvec)
 
-        # if intr.model=="SIMPLE_PINHOLE":
-        if intr.model=="SIMPLE_PINHOLE" or intr.model == "SIMPLE_RADIAL":
+        image_options = None
+        if undistort_images or compare_undistortion:
+            from utils.colmap_undistortion import colmap_image_options
+            image_options = colmap_image_options(intr, undistort_images, undistort_cache_dir)
+            matrix = image_options["colmap_calibration"]["matrix"]
+            FovX = focal2fov(matrix[0][0], width)
+            FovY = focal2fov(matrix[1][1], height)
+        elif intr.model=="SIMPLE_PINHOLE" or intr.model == "SIMPLE_RADIAL":
             focal_length_x = intr.params[0]
             FovY = focal2fov(focal_length_x, height)
             FovX = focal2fov(focal_length_x, width)
@@ -119,7 +127,8 @@ def readColmapCameras(cam_extrinsics, cam_intrinsics, images_folder):
         # print(f'image: {image.size}')
 
         cam_info = CameraInfo(uid=uid, R=R, T=T, FovY=FovY, FovX=FovX, image=image,
-                              image_path=image_path, image_name=image_name, width=width, height=height)
+                              image_path=image_path, image_name=image_name, width=width, height=height,
+                              image_options=image_options)
         cam_infos.append(cam_info)
     sys.stdout.write('\n')
     return cam_infos
@@ -164,7 +173,9 @@ def _find_colmap_sparse_dir(path):
         "No COLMAP cameras/images pair (.bin or .txt) found in sparse/ or sparse/0/ under {}".format(path))
 
 
-def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
+def readColmapSceneInfo(path, images, eval, lod, llffhold=8,
+                       undistort_images=False, undistort_cache_dir="outputs/undistorted",
+                       compare_undistortion=False):
     sparse_dir = _find_colmap_sparse_dir(path)
     try:
         cameras_extrinsic_file = os.path.join(sparse_dir, "images.bin")
@@ -178,7 +189,10 @@ def readColmapSceneInfo(path, images, eval, lod, llffhold=8):
         cam_intrinsics = read_intrinsics_text(cameras_intrinsic_file)
 
     reading_dir = "images" if images == None else images
-    cam_infos_unsorted = readColmapCameras(cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics, images_folder=os.path.join(path, reading_dir))
+    cam_infos_unsorted = readColmapCameras(
+        cam_extrinsics=cam_extrinsics, cam_intrinsics=cam_intrinsics,
+        images_folder=os.path.join(path, reading_dir), undistort_images=undistort_images,
+        undistort_cache_dir=undistort_cache_dir, compare_undistortion=compare_undistortion)
     cam_infos = sorted(cam_infos_unsorted.copy(), key = lambda x : x.image_name)
 
     if eval:

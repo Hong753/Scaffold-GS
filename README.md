@@ -223,6 +223,80 @@ This script will store the log (with running-time code) into ```outputs/dataset_
 
 
 
+### Compare on-demand COLMAP undistortion
+
+Undistortion is optional and disabled by default. To enable it for a normal run:
+
+```bash
+bash ./single_train.sh --undistort_images
+# Optional writable cache location (the source dataset is never modified):
+bash ./single_train.sh --undistort_images --undistort_cache_dir /path/to/cache
+```
+
+Only the selected camera image is decoded. On its first use, its COLMAP lens
+distortion is removed directly at the training resolution and a lossless RGBA
+PNG is written to `outputs/undistorted/`. Subsequent selections load that PNG
+from disk; cameras never retain decoded images in RAM or CUDA memory. Cache
+keys include the absolute source path, size, modification time, calibration,
+resolution and OpenCV/cache version. Remap tables are limited to two entries.
+Corrupt cached files are regenerated; corrupt source images are still skipped
+strictly. The cache grows only as frames are used and may be deleted to reclaim
+space.
+
+Supported COLMAP models: `SIMPLE_PINHOLE`, `PINHOLE`, `SIMPLE_RADIAL`, `RADIAL`,
+`OPENCV`, and `FULL_OPENCV`. Focal lengths, poses and image dimensions are
+preserved. The output principal point is centered to match the native renderer;
+invalid border pixels are masked in L1/SSIM training and PSNR evaluation. Saved
+ground-truth PNGs retain this mask in alpha. Offline LPIPS zeroes invalid borders
+in both images; use the common-grid PSNR below for the ablation. Fisheye and
+other camera models require COLMAP's offline `image_undistorter` instead. Feed
+the calibration belonging to the input images; do not apply an old radial
+calibration to images that have already been undistorted.
+
+Run the controlled raw/undistorted comparison with:
+
+```bash
+python compare_undistortion.py \
+  -s /data/hyejun_dataset/HandHeld/Orange_office_Colmap \
+  -o outputs/office_undistortion_ablation --gpu 0
+```
+
+This launches two **fresh, sequential 40k-step runs** using the existing seed 0,
+stride-3 sharp-frame selection, appearance dimension 0, resolution -1 (1600-pixel
+width cap), voxel size 0.001, and the same optimization defaults. Frame selection
+is scored on original images in both modes. It evaluates the same 32 training
+and 32 test views spread across each sequence at 7k, 30k and 40k; short runs
+always evaluate at their final step. Both jobs save their normal PLYs, while the
+expensive full-dataset render/evaluation pass is skipped. For a shorter pilot,
+append `--iterations 7000`; other options include `--resolution`, `--eval_views`,
+`--appearance_dim`, `--frame_selection_stride`, `--voxel_size`, and `--cache_dir`.
+Use `--dry_run` to inspect commands without running anything. A new output
+directory is required so existing experiments cannot be overwritten.
+
+The summary table uses **common raw-grid PSNR**: rectified predictions are warped
+back to the original image grid and both models are evaluated against the same
+original RGB pixels on identical valid support. Native-grid PSNR is also saved,
+but its targets differ between modes because undistortion resamples images.
+The comparison includes principal-point recentering when the original principal
+point was off-center, so any gain is a calibration-consistency gain rather than
+proof that the radial coefficient alone was responsible.
+
+Outputs under the chosen comparison directory:
+
+* `comparison.md` / `comparison.json`: train/test common-grid PSNR and differences.
+* `baseline/` / `undistorted/`: separate trained models and logs.
+* Each run's `undistortion.json`: calibration and sampled distortion displacement
+  in pixels at the original COLMAP resolution.
+* Each run's `comparison_metrics/`: per-view native/common-grid metrics.
+* Each run's `comparison_previews/`: four views per split and evaluation step;
+  panels show original RGB, prediction on the original grid, and absolute error ×4.
+
+Rebuild the summary without training:
+
+```bash
+python compare_undistortion.py -o outputs/office_undistortion_ablation --summarize
+```
+
 ### SuperSplat-compatible PLY saving
 
 Training saves at **7,000 and 30,000 iterations** by default (and at the final

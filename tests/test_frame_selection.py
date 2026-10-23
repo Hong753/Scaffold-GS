@@ -185,7 +185,7 @@ def test_scene_subsamples_train_only_and_preserves_reload_ids(tmp_path, monkeypa
             pass
 
     namespace = dict(os=os, random=random, json=json, GaussianModel=object, ModelParams=object,
-                     sceneLoadTypeCallbacks={"Colmap": lambda *args: info},
+                     sceneLoadTypeCallbacks={"Colmap": lambda *args, **kwargs: info},
                      cameraList_from_camInfos=lambda cameras, *args: cameras,
                      camera_to_JSON=lambda index, item: {"path": item.image_path},
                      select_training_frames=select_training_frames)

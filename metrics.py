@@ -28,7 +28,7 @@ def readImages(renders_dir, gt_dir):
         with Image.open(renders_dir / fname) as render:
             render_tensor = tf.to_tensor(render).unsqueeze(0)[:, :3, :, :]
         with Image.open(gt_dir / fname) as gt:
-            gt_tensor = tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :]
+            gt_tensor = tf.to_tensor(gt).unsqueeze(0)
         yield fname, render_tensor, gt_tensor
 
 @torch.no_grad()
@@ -73,9 +73,12 @@ def evaluate(model_paths):
                     image_names.append(image_name)
                     rendering = rendering.to(metric_device)
                     gt = gt.to(metric_device)
-                    ssims.append(ssim(rendering, gt))
-                    psnrs.append(psnr(rendering, gt))
-                    lpipss.append(lpips_fn(rendering, gt).detach())
+                    mask = gt[:, 3:4] if gt.shape[1] == 4 else None
+                    gt = gt[:, :3]
+                    ssims.append(ssim(rendering, gt, mask=mask))
+                    psnrs.append(psnr(rendering, gt, mask=mask))
+                    lpipss.append(lpips_fn(rendering if mask is None else rendering * mask,
+                                          gt if mask is None else gt * mask).detach())
 
                 if not image_names:
                     print("  No valid rendered image pairs; skipping metrics.")

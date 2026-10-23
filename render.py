@@ -45,9 +45,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     # debug = 0
     t_list = []
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        gt = view.try_load_image(background.device)
-        if gt is None:
+        loaded = view.try_load_image(background.device, return_mask=True)
+        if loaded is None:
             continue
+        gt, valid_mask = loaded
 
         torch.cuda.synchronize(); t0 = time.time()
         voxel_visible_mask = prefilter_voxel(view, gaussians, pipeline, background)
@@ -60,7 +61,8 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         gt = gt[0:3, :, :]
         name_list.append('{0:05d}'.format(idx) + ".png")
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        saved_gt = torch.cat((gt, valid_mask), dim=0) if valid_mask is not None else gt
+        torchvision.utils.save_image(saved_gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
 
     valid_names = set(name_list)
     for directory in (render_path, gts_path):

@@ -48,7 +48,7 @@ def open_image(path):
         raise OSError(error.errno, f"Could not load camera image: {error}", str(path)) from error
 
 
-def sample_training_camera(cameras, stack, device):
+def sample_training_camera(cameras, stack, device, return_mask=False):
     """Return a valid view for this step, excluding known corrupt views."""
     while True:
         if not stack:
@@ -56,14 +56,25 @@ def sample_training_camera(cameras, stack, device):
             if not stack:
                 raise RuntimeError("No decodable training images remain; check the reported image paths.")
         camera = stack.pop(randrange(len(stack)))
-        image = camera.try_load_image(device)
+        image = camera.try_load_image(device, return_mask=True) if return_mask else camera.try_load_image(device)
         if image is not None:
+            if return_mask:
+                rgb, mask = image
+                return camera, rgb, stack, mask
             return camera, image, stack
 
 
-def load_image_tensor(path, resolution, options=None):
+def load_image_tensor(path, resolution, options=None, return_mask=False):
     """Decode, preprocess and resize one image; always close its source file."""
     options = options or {}
+    if options.get("undistort_colmap"):
+        from utils.colmap_undistortion import load_rectified_image
+        import torch
+
+        pixels = load_rectified_image(path, resolution, options, open_image)
+        rgb = torch.from_numpy(pixels[:, :, :3].copy()).permute(2, 0, 1).float() / 255.
+        mask = torch.from_numpy(pixels[:, :, 3:4].copy()).permute(2, 0, 1).float() / 255.
+        return (rgb.contiguous(), mask.contiguous()) if return_mask else rgb.contiguous()
     with open_image(path) as source:
         image = source
         if "undistortion" in options:
@@ -85,4 +96,4 @@ def load_image_tensor(path, resolution, options=None):
     rgb = tensor[:3].clamp(0.0, 1.0)
     if tensor.shape[0] == 4:
         rgb = rgb * tensor[3:4]
-    return rgb.contiguous()
+    return (rgb.contiguous(), None) if return_mask else rgb.contiguous()

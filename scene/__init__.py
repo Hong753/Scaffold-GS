@@ -30,6 +30,8 @@ class Scene:
         self.model_path = args.model_path
         self.loaded_iter = None
         self.gaussians = gaussians
+        self.compare_undistortion = getattr(args, "compare_undistortion", False)
+        self.comparison_eval_views = getattr(args, "comparison_eval_views", 32)
 
         if load_iteration:
             if load_iteration == -1:
@@ -43,12 +45,34 @@ class Scene:
         self.test_cameras = {}
         
         if os.path.exists(os.path.join(args.source_path, "sparse")):
-            scene_info = sceneLoadTypeCallbacks["Colmap"](args.source_path, args.images, args.eval, args.lod)
+            scene_info = sceneLoadTypeCallbacks["Colmap"](
+                args.source_path, args.images, args.eval, args.lod,
+                undistort_images=getattr(args, "undistort_images", False),
+                undistort_cache_dir=getattr(args, "undistort_cache_dir", "outputs/undistorted"),
+                compare_undistortion=self.compare_undistortion)
         elif os.path.exists(os.path.join(args.source_path, "transforms_train.json")):
             print("Found transforms_train.json file, assuming Blender data set!")
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, ply_path=ply_path)
         else:
             assert False, "Could not recognize scene type!"
+
+        if getattr(args, "undistort_images", False) or self.compare_undistortion:
+            if not os.path.exists(os.path.join(args.source_path, "sparse")):
+                raise ValueError("--undistort_images/--compare_undistortion require a COLMAP scene")
+            from utils.colmap_undistortion import calibration_summary
+            summaries = {}
+            for camera in scene_info.train_cameras + scene_info.test_cameras:
+                if camera.uid not in summaries:
+                    summaries[camera.uid] = calibration_summary(camera.image_options["colmap_calibration"])
+            os.makedirs(self.model_path, exist_ok=True)
+            with open(os.path.join(self.model_path, "undistortion.json"), "w") as stream:
+                json.dump({"enabled": getattr(args, "undistort_images", False),
+                           "cache_dir": getattr(args, "undistort_cache_dir", "outputs/undistorted"),
+                           "output_principal_point": "image center; focal lengths unchanged",
+                           "cameras": summaries}, stream, indent=2)
+            max_shift = max(item["sampled_max_shift_px"] for item in summaries.values())
+            print(f"[Undistortion] {'Enabled' if getattr(args, 'undistort_images', False) else 'Baseline'}; "
+                  f"sampled maximum lens displacement {max_shift:.2f} px at COLMAP resolution")
 
         scene_info = scene_info._replace(train_cameras=select_training_frames(
             scene_info.train_cameras,

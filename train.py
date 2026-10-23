@@ -123,8 +123,8 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         # Decode before rendering. A corrupt view is replaced within this step,
         # so skipped files do not consume optimization iterations.
-        viewpoint_cam, gt_image, viewpoint_stack = sample_training_camera(
-            scene.getTrainCameras(), viewpoint_stack, background.device)
+        viewpoint_cam, gt_image, viewpoint_stack, valid_mask = sample_training_camera(
+            scene.getTrainCameras(), viewpoint_stack, background.device, return_mask=True)
 
         # Render
         if (iteration - 1) == debug_from:
@@ -136,14 +136,14 @@ def training(dataset, opt, pipe, dataset_name, testing_iterations, saving_iterat
         
         image, viewspace_point_tensor, visibility_filter, offset_selection_mask, radii, scaling, opacity = render_pkg["render"], render_pkg["viewspace_points"], render_pkg["visibility_filter"], render_pkg["selection_mask"], render_pkg["radii"], render_pkg["scaling"], render_pkg["neural_opacity"]
 
-        Ll1 = l1_loss(image, gt_image)
+        Ll1 = l1_loss(image, gt_image, mask=valid_mask)
 
-        ssim_loss = (1.0 - ssim(image, gt_image))
+        ssim_loss = (1.0 - ssim(image, gt_image, mask=valid_mask))
         scaling_reg = scaling.prod(dim=1).mean()
         loss = (1.0 - opt.lambda_dssim) * Ll1 + opt.lambda_dssim * ssim_loss + 0.01*scaling_reg
 
         loss.backward()
-        del gt_image
+        del gt_image, valid_mask
         
         iter_end.record()
 
@@ -223,12 +223,20 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
         torch.cuda.empty_cache()
         validation_configs = ({'name': 'test', 'cameras' : scene.getTestCameras()}, 
                               {'name': 'train', 'cameras' : [scene.getTrainCameras()[idx % len(scene.getTrainCameras())] for idx in range(5, 30, 5)]})
+        comparing = getattr(scene, "compare_undistortion", False)
+        if comparing:
+            from utils.undistortion_comparison import evaluation_cameras, write_evaluation
+            from utils.colmap_undistortion import common_grid_psnr
+            validation_configs = tuple({"name": name, "cameras": evaluation_cameras(
+                cameras, scene.comparison_eval_views)} for name, cameras in (
+                    ("test", scene.getTestCameras()), ("train", scene.getTrainCameras())))
 
         for config in validation_configs:
             if config['cameras'] and len(config['cameras']) > 0:
                 l1_test = 0.0
                 psnr_test = 0.0
                 valid_views = 0
+                comparison_records = []
                 
                 if wandb is not None:
                     gt_image_list = []
@@ -236,9 +244,10 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                     errormap_list = []
 
                 for idx, viewpoint in enumerate(config['cameras']):
-                    gt_image = viewpoint.try_load_image(renderArgs[1].device)
-                    if gt_image is None:
+                    loaded = viewpoint.try_load_image(renderArgs[1].device, return_mask=True)
+                    if loaded is None:
                         continue
+                    gt_image, valid_mask = loaded
                     voxel_visible_mask = prefilter_voxel(viewpoint, scene.gaussians, *renderArgs)
                     image = torch.clamp(renderFunc(viewpoint, scene.gaussians, *renderArgs, visible_mask=voxel_visible_mask)["render"], 0.0, 1.0)
                     gt_image = torch.clamp(gt_image, 0.0, 1.0)
@@ -256,8 +265,17 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                             if wandb:
                                 gt_image_list.append(gt_image[None])
 
-                    l1_test += l1_loss(image, gt_image).mean().double()
-                    psnr_test += psnr(image, gt_image).mean().double()
+                    l1_test += l1_loss(image, gt_image, mask=valid_mask).mean().double()
+                    view_psnr = psnr(image, gt_image, mask=valid_mask).mean().double()
+                    psnr_test += view_psnr
+                    if comparing:
+                        from pathlib import Path
+                        preview = (Path(scene.model_path) / "comparison_previews" / str(iteration) /
+                                   config["name"] / f"{idx:03d}.png") if idx < 4 else None
+                        raw_psnr, pixels = common_grid_psnr(image, viewpoint, preview_path=preview)
+                        comparison_records.append({"image": viewpoint.image_name,
+                                                   "native_psnr": view_psnr.item(),
+                                                   "raw_grid_psnr": raw_psnr, "raw_grid_pixels": pixels})
 
                 
                 
@@ -267,6 +285,11 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
                 psnr_test /= valid_views
                 l1_test /= valid_views
                 logger.info("\n[ITER {}] Evaluating {} ({} valid views): L1 {} PSNR {}".format(iteration, config['name'], valid_views, l1_test, psnr_test))
+                if comparing:
+                    write_evaluation(scene.model_path, iteration, config["name"], comparison_records)
+                    raw_mean = sum(item["raw_grid_psnr"] for item in comparison_records) / valid_views
+                    logger.info(f"[ITER {iteration}] {config['name']} common raw-grid PSNR {raw_mean:.4f} "
+                                f"({valid_views} fixed views; identical original-image support)")
 
                 
                 if tb_writer:
@@ -295,9 +318,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     name_list = []
     per_view_dict = {}
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
-        gt = view.try_load_image(background.device)
-        if gt is None:
+        loaded = view.try_load_image(background.device, return_mask=True)
+        if loaded is None:
             continue
+        gt, valid_mask = loaded
         
         torch.cuda.synchronize();t_start = time.time()
         
@@ -318,12 +342,15 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         
         # error maps
         errormap = (rendering - gt).abs()
+        if valid_mask is not None:
+            errormap = errormap * valid_mask
 
 
         name_list.append('{0:05d}'.format(idx) + ".png")
         torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
         torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        saved_gt = torch.cat((gt, valid_mask), dim=0) if valid_mask is not None else gt
+        torchvision.utils.save_image(saved_gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
         per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
 
     for directory in (render_path, error_path, gts_path):
@@ -373,7 +400,7 @@ def readImages(renders_dir, gt_dir):
         with Image.open(renders_dir / fname) as render:
             render_tensor = tf.to_tensor(render).unsqueeze(0)[:, :3, :, :]
         with Image.open(gt_dir / fname) as gt:
-            gt_tensor = tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :]
+            gt_tensor = tf.to_tensor(gt).unsqueeze(0)
         yield fname, render_tensor, gt_tensor
 
 @torch.no_grad()
@@ -415,9 +442,14 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
             image_names.append(image_name)
             rendering = rendering.to(metric_device)
             gt = gt.to(metric_device)
-            ssims.append(ssim(rendering, gt))
-            psnrs.append(psnr(rendering, gt))
-            lpipss.append(lpips_fn(rendering, gt).detach())
+            mask = gt[:, 3:4] if gt.shape[1] == 4 else None
+            gt = gt[:, :3]
+            ssims.append(ssim(rendering, gt, mask=mask))
+            psnrs.append(psnr(rendering, gt, mask=mask))
+            # LPIPS has no native per-pixel mask. Zero both invalid borders;
+            # common-grid PSNR is the metric used for the controlled ablation.
+            lpipss.append(lpips_fn(rendering if mask is None else rendering * mask,
+                                  gt if mask is None else gt * mask).detach())
 
         if not image_names:
             logger.warning("No valid rendered image pairs for %s; skipping metrics.", method)
@@ -489,10 +521,14 @@ if __name__ == "__main__":
     parser.add_argument("--test_iterations", nargs="+", type=int, default=[30_000])
     parser.add_argument("--save_iterations", nargs="+", type=int, default=[7_000, 30_000])
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument("--skip_final_render", action="store_true",
+                        help="Finish after training/validation; useful for controlled comparison runs")
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--gpu", type=str, default = '-1')
     args = parser.parse_args(sys.argv[1:])
+    if args.compare_undistortion and args.comparison_eval_views < 1:
+        parser.error("--comparison_eval_views must be positive")
     args.save_iterations.append(args.iterations)
 
     
@@ -541,6 +577,9 @@ if __name__ == "__main__":
 
     # All done
     logger.info("\nTraining complete.")
+
+    if args.skip_final_render:
+        sys.exit(0)
 
     # rendering
     logger.info(f'\nStarting Rendering~')
