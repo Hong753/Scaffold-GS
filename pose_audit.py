@@ -15,6 +15,8 @@ def main():
     parser.add_argument("--max_points", type=int, default=100000)
     parser.add_argument("--max_frustums", type=int, default=120)
     parser.add_argument("--report_only", action="store_true", help="Write an offline image-overlay gallery and exit")
+    parser.add_argument("--analyze_only", action="store_true", help="Compute all-view reprojection statistics, export image comparisons, and package a ZIP")
+    parser.add_argument("--refresh_analysis", action="store_true", help="Recompute the cached all-view analysis")
     parser.add_argument("--views", type=int, default=24, help="Evenly spaced images for offline report")
     parser.add_argument("--output", type=Path, help="Report directory; default RUN/pose_audit")
     args = parser.parse_args()
@@ -27,9 +29,16 @@ def main():
         print("Indexing COLMAP poses and sparse points (no CUDA or Gaussian model required)…", flush=True)
         data = PoseAuditData(args.model_path, args.source_path, args.resolution)
         print(f"Indexed {len(data.frames):,} cameras and {len(data.xyz):,} points; image pixels load only on selection.", flush=True)
-        if args.report_only:
-            output = args.output or (data.root or Path("outputs")) / "pose_audit"
-            print(f"Report: {data.export_report(output, args.views).resolve()}")
+        from utils.pose_audit_analysis import analyze_reprojection, package_report, report_indices, summary_text
+        output = args.output or (data.root or Path("outputs")) / "pose_audit"
+        data.analysis = analyze_reprojection(data, output, lambda message: print(message, flush=True), args.refresh_analysis)
+        print(summary_text(data.analysis), flush=True)
+        if args.report_only or args.analyze_only:
+            indices = report_indices(data.analysis, args.views)
+            report = data.export_report(output, args.views, indices=indices, analysis=data.analysis,
+                                         progress=lambda message: print(message, flush=True))
+            print(f"Report: {report.resolve()}")
+            print(f"SEND THIS FILE: {package_report(output).resolve()}", flush=True)
             return
         try:
             from utils.pose_audit_app import PoseAuditApp

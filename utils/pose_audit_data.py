@@ -258,6 +258,7 @@ class PoseAuditData:
             counts[Path(frame.name).name] = counts.get(Path(frame.name).name, 0) + 1
         self.collisions = {name for name, count in counts.items() if count > 1}
         self.association_counts = {}
+        self.analysis = None
 
     def image_path(self, frame):
         # Deliberately reproduce training's basename mapping, while reporting
@@ -324,6 +325,46 @@ class PoseAuditData:
         for x, y in projected[visible]:
             draw.ellipse((x - 1.5, y - 1.5, x + 1.5, y + 1.5), outline=(255, 177, 49))
         return np.asarray(image), len(visible)
+
+    def sparse_projection(self, index, resolution, space="Training input", max_points=250000):
+        """Render sparse RGB landmarks into a separate image with a point depth buffer."""
+        frame = self.frames[index]
+        calibration = self.options[frame.camera_id]["colmap_calibration"]
+        chosen = np.linspace(0, len(self.xyz) - 1, min(max_points, len(self.xyz)), dtype=int)
+        projected, camera_xyz = project_points(self.xyz[chosen], frame, calibration)
+        width, height = resolution
+        if space == "Training input":
+            matrix = np.array(calibration["matrix"])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                projected = camera_xyz[:, :2] / camera_xyz[:, 2:3]
+                projected *= [matrix[0, 0] * width / calibration["width"], matrix[1, 1] * height / calibration["height"]]
+                projected += [(width - 1) / 2, (height - 1) / 2]
+        else:
+            projected = projected * [width / calibration["width"], height / calibration["height"]] - .5
+        valid = (camera_xyz[:, 2] > 0) & np.isfinite(projected).all(axis=1)
+        valid &= ((projected[:, 0] >= 0) & (projected[:, 0] <= width - 1) &
+                  (projected[:, 1] >= 0) & (projected[:, 1] <= height - 1))
+        indices = np.flatnonzero(valid)
+        xy = np.rint(projected[indices]).astype(int)
+        z = camera_xyz[indices, 2]
+        order = np.argsort(z, kind="stable")
+        _, first = np.unique(xy[order, 1] * width + xy[order, 0], return_index=True)
+        selected = order[first]
+        xy, z, colors = xy[selected], z[selected], self.rgb[chosen[indices[selected]]]
+        image = np.zeros((height, width, 3), np.uint8)
+        depth = np.full((height, width), np.inf)
+        # Centers are unique. Each shifted set is also unique, so updates
+        # safely resolve the nearest sampled landmark across the 3x3 footprints.
+        for dy in (-1, 0, 1):
+            for dx in (-1, 0, 1):
+                x, y = xy[:, 0] + dx, xy[:, 1] + dy
+                inside = (x >= 0) & (x < width) & (y >= 0) & (y < height)
+                candidates = np.flatnonzero(inside)
+                keep = candidates[z[candidates] < depth[y[candidates], x[candidates]]]
+                image[y[keep], x[keep]] = colors[keep]
+                depth[y[keep], x[keep]] = z[keep]
+        return image, dict(projected_points=len(selected), sampled_points=len(chosen),
+                           covered_pixels=int(np.isfinite(depth).sum()))
 
     def inspect(self, index, space="Training input", limit=500, mode="Both"):
         from utils.image_loading import load_image_tensor, open_image
@@ -417,37 +458,48 @@ class PoseAuditData:
             details["previous_rotation_degrees"] = math.degrees(math.acos(np.clip((np.trace(relative) - 1) / 2, -1, 1)))
         return overlay, pixels, xyz[positive], details
 
-    def export_report(self, output, count=24, group="Training subset"):
+    def export_report(self, output, count=24, group="Training subset", indices=None, analysis=None, progress=None):
         from utils.image_loading import CorruptImageError
 
         output = Path(output)
         output.mkdir(parents=True, exist_ok=True)
         groups = self.groups()
         candidates = groups.get(group, groups["All COLMAP images"])
-        indices = np.linspace(0, len(candidates) - 1, min(count, len(candidates)), dtype=int)
+        if indices is None:
+            indices = [candidates[item] for item in np.linspace(0, len(candidates) - 1, min(count, len(candidates)), dtype=int)]
         records, cards = [], []
-        for number, item in enumerate(indices):
-            index = candidates[item]
+        for number, index in enumerate(indices):
+            if progress and (number % 4 == 0 or number == len(indices) - 1):
+                progress(f"Rendering audit comparisons: {number + 1}/{len(indices)} · {self.frames[index].name}")
             try:
-                raw, _, _, details = self.inspect(index, "Original image")
+                raw, query, _, details = self.inspect(index, "Original image")
                 trained, _, _, _ = self.inspect(index, "Training input")
+                cloud, projection = self.sparse_projection(index, details["training_size"], "Original image")
             except (CorruptImageError, FileNotFoundError) as error:
                 records.append({"image": self.frames[index].name, "error": str(error)})
                 cards.append(f'<article><h2>{html.escape(self.frames[index].name)}</h2><p>{html.escape(str(error))}</p></article>')
                 continue
             files = []
-            for suffix, pixels in (("raw", raw), ("training", trained)):
+            for suffix, pixels in (("query", query), ("cloud", cloud), ("raw", raw), ("training", trained)):
                 image = Image.fromarray(pixels)
-                image.thumbnail((1200, 1200))
                 name = f"{number:03d}_{suffix}.png"
                 image.save(output / name)
                 files.append(name)
             records.append(details)
+            status = (details["correspondence_status"] + " Numeric residuals are unavailable."
+                      if details["associated_points"] == 0 else f"{details['associated_points']:,} associated points; cyan observations / orange projections / red residuals.")
             cards.append(f'<article><h2>{html.escape(details["image"])}</h2>'
+                         f'<p><strong>{html.escape(status)}</strong></p>'
                          f'<p>{html.escape(json.dumps({key: details[key] for key in ("split", "colmap_reprojection_px", "training_projection_px", "warnings")}))}</p>'
-                         f'<div><figure><figcaption>Original image + COLMAP projection</figcaption><a href="{files[0]}"><img src="{files[0]}"></a></figure>'
-                         f'<figure><figcaption>Training input + native projection</figcaption><a href="{files[1]}"><img src="{files[1]}"></a></figure></div></article>')
+                         f'<div><figure><figcaption>Captured RGB</figcaption><a href="{files[0]}"><img src="{files[0]}"></a></figure>'
+                         f'<figure><figcaption>Reprojected sparse cloud · {projection["projected_points"]:,} points</figcaption><a href="{files[1]}"><img src="{files[1]}"></a></figure></div>'
+                         f'<div><figure><figcaption>Original image + matched reprojection overlay</figcaption><a href="{files[2]}"><img src="{files[2]}"></a></figure>'
+                         f'<figure><figcaption>Training input + native projection</figcaption><a href="{files[3]}"><img src="{files[3]}"></a></figure></div></article>')
         (output / "summary.json").write_text(json.dumps(records, indent=2) + "\n")
+        overview = ""
+        if analysis:
+            from utils.pose_audit_analysis import summary_text
+            overview = '<pre>' + html.escape(summary_text(analysis)) + '</pre>'
         page = ('<!doctype html><meta charset="utf-8"><title>Scaffold-GS pose audit</title>'
                 '<style>body{background:#111820;color:#e5edf5;font:15px system-ui;margin:24px}h1{font-size:26px}'
                 'article{border-top:1px solid #344353;padding:18px 0}article div{display:flex;gap:12px}'
@@ -455,8 +507,10 @@ class PoseAuditData:
                 'figcaption{margin:8px 0}@media(max-width:800px){article div{display:block}}</style>'
                 '<h1>Image / pose audit</h1><p>Cyan circles: COLMAP observations. Orange crosses: projected 3D points. '
                 'Red lines: residuals. Click an image to inspect pixels. Statistics use all associated points; overlays are sampled.</p>'
+                '<p>The separate cloud image projects the sparse RGB landmarks using the saved camera. Black areas have no sampled points; '
+                'nearest-point depth buffering is not a complete surface visibility test. This is not a trained Gaussian render.</p>'
                 '<p>Low reprojection error measures COLMAP self-consistency. Inspect the marks on real image features: '
                 'it does not prove that filenames still identify the same captured frames or that poses are globally correct.</p>'
-                + ''.join(cards))
+                + overview + ''.join(cards))
         (output / "index.html").write_text(page)
         return output / "index.html"

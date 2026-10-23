@@ -8,11 +8,14 @@ import json
 from pathlib import Path
 import socket
 import re
+import subprocess
+import sys
 import struct
 import threading
 import time
 import urllib.request
 import warnings
+import zipfile
 
 import cv2
 import numpy as np
@@ -228,7 +231,7 @@ def test_wrong_rgb_can_have_zero_colmap_error_and_report_explains_limitation(tmp
     report = data.export_report(tmp_path / "report", count=2)
     page = report.read_text()
     assert "does not prove" in page and "Original image" in page and "Training input" in page
-    assert len(list(report.parent.glob("*.png"))) == 4
+    assert len(list(report.parent.glob("*.png"))) == 8
 
 
 def test_report_records_missing_images_instead_of_silently_dropping_them(tmp_path):
@@ -495,3 +498,132 @@ def test_disconnect_while_decoding_drops_result_and_server_accepts_new_client(tm
         finally:
             release.set()
         assert not any("closed connection" in str(item.message) for item in captured)
+
+
+def test_automatic_reprojection_scans_every_view_without_opening_rgb_and_cache_invalidates(tmp_path, monkeypatch):
+    from utils.pose_audit_analysis import analyze_reprojection, summary_text
+
+    source, model = make_dataset(tmp_path, bad_pose=True)
+    data = PoseAuditData(model)
+    output = model / 'pose_audit'
+    with monkeypatch.context() as guard:
+        guard.setattr(Image, 'open', lambda *a, **k: pytest.fail('Numeric scan opened RGB'))
+        analysis = analyze_reprojection(data, output)
+    assert analysis['summary']['measured_views'] == 4
+    assert analysis['summary']['measured_points'] == 12
+    assert analysis['ranked_indices'][0] == 1
+    assert analysis['views'][1]['median'] > 4
+    assert analysis['views'][0]['median'] < 1e-8
+    assert 'Observation-weighted RMSE' in summary_text(analysis)
+    assert analysis['summary']['observation_rmse_px'] > 1
+    with monkeypatch.context() as guard:
+        guard.setattr(data, 'frame_matches', lambda *a: pytest.fail('Cache rescanned observations'))
+        assert analyze_reprojection(data, output)['fingerprint'] == analysis['fingerprint']
+    # Changing a real source file invalidates the metadata fingerprint.
+    path = source / 'sparse/0/points3D.bin'
+    import os
+    metadata = path.stat()
+    os.utime(path, ns=(metadata.st_atime_ns, metadata.st_mtime_ns + 1000000))
+    refreshed = analyze_reprojection(data, output)
+    assert refreshed['fingerprint'] != analysis['fingerprint']
+    assert len((output / 'reprojection.csv').read_text().splitlines()) == 5
+
+
+def test_automatic_scan_explains_absent_observations_instead_of_reporting_zero_error(tmp_path):
+    from utils.pose_audit_analysis import analyze_reprojection, summary_text
+
+    _, model = make_dataset(tmp_path)
+    data = PoseAuditData(model)
+    for frame in data.frames:
+        frame.count = 0
+    analysis = analyze_reprojection(data)
+    assert analysis['summary']['measured_views'] == 0
+    assert analysis['summary']['median_view_error_px'] is None
+    assert analysis['summary']['observation_rmse_px'] is None
+    assert analysis['summary']['status_counts']['no_features'] == 4
+    assert 'NUMERIC REPROJECTION UNAVAILABLE' in summary_text(analysis)
+    assert 'no stored 2D feature observations' in summary_text(analysis)
+
+
+@pytest.mark.parametrize('space', ['Original image', 'Training input'])
+def test_separate_sparse_rgb_projection_uses_camera_and_nearest_point_depth(tmp_path, monkeypatch, space):
+    _, model = make_dataset(tmp_path, distortion=0.)
+    data = PoseAuditData(model)
+    data.xyz = np.array([[0., 0., 4.], [0., 0., 8.], [.1, 0., -2.]])
+    data.rgb = np.array([[255, 0, 0], [0, 255, 0], [0, 0, 255]], np.uint8)
+    with monkeypatch.context() as guard:
+        guard.setattr(Image, 'open', lambda *a, **k: pytest.fail('Point projection opened RGB'))
+        image, details = data.sparse_projection(0, (160, 120), space)
+    assert image.shape == (120, 160, 3)
+    assert details['projected_points'] == 1 and details['covered_pixels'] == 9
+    np.testing.assert_array_equal(image[60, 80], [255, 0, 0])
+    assert image[:, :, 1:].max() == 0
+    assert (image[0, 0] == 0).all()
+
+
+@pytest.mark.parametrize('no_observations', [False, True])
+def test_automatic_report_cli_prints_numbers_and_creates_one_shareable_zip(tmp_path, no_observations):
+    source, model = make_dataset(tmp_path, suffix='txt', bad_pose=True)
+    if no_observations:
+        path = source / 'sparse/0/images.txt'
+        lines = path.read_text().splitlines()
+        for index in range(2, len(lines), 2):
+            lines[index] = ''
+        path.write_text('\n'.join(lines) + '\n')
+    result = subprocess.run([sys.executable, str(Path(__file__).resolve().parents[1] / 'pose_audit.py'),
+                             '-m', str(model), '--analyze_only', '--views', '2'],
+                            capture_output=True, text=True, timeout=30)
+    assert result.returncode == 0, result.stderr
+    assert 'SEND THIS FILE:' in result.stdout
+    assert ('0 / 4 views' if no_observations else '4 / 4 views') in result.stdout
+    archive = model / 'pose_audit_results.zip'
+    with zipfile.ZipFile(archive) as bundle:
+        assert 'pose_audit/reprojection.csv' in bundle.namelist()
+        analysis = json.loads(bundle.read('pose_audit/reprojection.json'))
+        assert analysis['summary']['measured_views'] == (0 if no_observations else 4)
+        if not no_observations:
+            assert analysis['ranked_indices'][0] == 1
+        page = bundle.read('pose_audit/index.html').decode()
+        assert 'Captured RGB' in page and 'Reprojected sparse cloud' in page
+        assert ('NUMERIC REPROJECTION UNAVAILABLE' if no_observations else 'Observation-weighted RMSE') in page
+        assert len([name for name in bundle.namelist() if name.endswith('.png')]) == 8
+        previews = json.loads(bundle.read('pose_audit/summary.json'))
+        assert previews[0]['image'] == ('frame1.png' if no_observations else 'frame2.png')
+
+
+def test_report_zip_excludes_unreferenced_old_previews_and_samples_full_sequence(tmp_path):
+    from utils.pose_audit_analysis import analyze_reprojection, package_report, report_indices
+
+    _, model = make_dataset(tmp_path)
+    data = PoseAuditData(model)
+    analysis = analyze_reprojection(data, model / 'pose_audit')
+    selected = report_indices(analysis, 3)
+    assert len(selected) == 3 and len(set(selected)) == 3
+    assert len(report_indices(analysis, 100)) == 4
+    report = data.export_report(model / 'pose_audit', 2, indices=selected[:2], analysis=analysis)
+    (report.parent / '999_query.png').write_bytes(b'old preview')
+    with zipfile.ZipFile(package_report(report.parent)) as bundle:
+        assert 'pose_audit/999_query.png' not in bundle.namelist()
+
+
+@pytest.mark.parametrize('all_missing', [False, True])
+def test_browser_automatically_finds_supported_view_and_always_shows_separate_projection(tmp_path, all_missing):
+    _, model = make_dataset(tmp_path)
+    data = PoseAuditData(model)
+    for frame in data.frames:
+        if all_missing or frame.split == 'train':
+            frame.count = 0
+    with audit_runtime(data) as (app, port):
+        with audit_connection(port):
+            wait_for(lambda: bool(app.clients) and bool(next(iter(app.clients.values())).png))
+            state = next(iter(app.clients.values()))
+            page = state.controls['image'].content
+            assert 'Captured RGB' in page and 'Reprojected sparse cloud' in page
+            assert state.query_png and state.projection_png and state.query_png != state.projection_png
+            assert state.has_matches is not all_missing
+            if all_missing:
+                assert 'No 2D–3D matches' in page
+                assert 'alignment cannot be scored' in state.controls['alignment'].content
+            else:
+                assert state.controls['group'].value == 'All COLMAP images'
+                assert 'Reprojection median / p95' in state.controls['alignment'].content

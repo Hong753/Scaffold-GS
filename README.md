@@ -306,6 +306,32 @@ python compare_undistortion.py -o outputs/office_undistortion_ablation --summari
 
 ### Visually audit image / camera alignment
 
+To compute the reprojection numbers automatically and prepare one file to share:
+
+```bash
+runs=(outputs/data/hyejun_dataset/HandHeld/Orange_office_Colmap/undistorted/*/)
+python pose_audit.py -m "${runs[-1]}" --analyze_only
+```
+
+This scans **all COLMAP views**, prints how many have usable 2D–3D associations,
+the median of per-view median residuals and the observation-weighted RMSE, and
+lists the largest per-view median residuals with point counts and spatial
+coverage (occupied cells of a 4×4 image grid). Units are original COLMAP
+calibration pixels. It writes `RUN/pose_audit/reprojection.csv`, JSON and a text
+summary, plus a report with 24 example views chosen from high-residual images
+and a sequence-wide sample. Statistics include all associations, not only the
+drawn points. If associations are absent, it explicitly reports measurements
+as unavailable; zero measurements do not establish zero error or bad poses.
+
+The last line, **SEND THIS FILE**, gives `RUN/pose_audit_results.zip`. It contains
+the numeric results and an offline HTML report with captured RGB, a **separate
+color reprojection of the sparse cloud**, and original/training residual
+overlays. The colored cloud uses a nearest-point depth buffer with small point
+footprints; sparse gaps and incomplete occlusion handling remain. It is a visual
+comparison, not an independently measured pose error or a trained Gaussian
+render. Images export at training resolution, one view at a time. No browser,
+GPU, or trained checkpoint is needed for this command.
+
 Run this alongside training; it uses the original COLMAP model and needs no GPU
 or saved Gaussian checkpoint:
 
@@ -331,7 +357,13 @@ sets the pose and vertical FOV; the browser viewport aspect can differ from the
 source image, so use the 2D overlays for pixel-level alignment.
 
 The separate, resizable **Image inspector** starts on the left. Its PNG retains
-the complete training resolution. `Image zoom → 100%` shows one image pixel per
+the complete training resolution. It always shows **Captured RGB** beside
+**Reprojected sparse cloud**, with the matched residual overlay below when
+associations exist. Original-image projection is the default. A frame with
+matches is selected automatically if the first frame has none; if necessary,
+the selector switches to all COLMAP images. The same cached all-view analysis
+runs at startup; cache validity tracks the sparse files and view membership.
+Use `--refresh_analysis` to force recomputation. `Image zoom → 100%` shows one image pixel per
 CSS pixel; scroll inside the image to inspect different regions. `200%` enlarges
 the pixels further; `Fit` shows the full frame. Drag or resize the panel, or
 hide it with `Show image inspector` under `3D display`.
@@ -365,8 +397,10 @@ previous-frame translation/rotation, and path/aspect-ratio warnings. COLMAP resi
 original calibration's pixels; training residuals are in training pixels.
 Statistics include all supported associated points; the overlay is sampled for
 readability. `Download overlay PNG` saves at the actual training resolution.
-Camera metadata is indexed once, while per-image observations and pixels load
-on selection; the audit does not load all video frames or feature arrays into RAM.
+Camera metadata is indexed once. The automatic scan streams feature records
+without opening RGB files; it retains only per-view scalar statistics. Image
+pixels load on selection; the audit does not load all video frames or all
+feature arrays into RAM.
 
 **How to interpret it:** observations and projections should coincide and land
 on the corresponding real image features. Low reprojection error shows COLMAP
@@ -377,13 +411,14 @@ COLMAP's corner-based coordinates and the CUDA rasterizer's pixel-center mapping
 Pruned/moved Gaussians are not used: these overlays audit the original sparse
 reconstruction and the image preprocessing.
 
-For an offline report of 24 evenly spaced training images:
+The older offline-report command is also supported; it now includes the same
+automatic statistics and ZIP:
 
 ```bash
 python pose_audit.py -m "${runs[-1]}" --report_only --views 24
 ```
 
-Open the printed `RUN/pose_audit/index.html`; `summary.json` and the two PNGs per
+Open the printed `RUN/pose_audit/index.html`; `summary.json` and the four PNGs per
 image can be shared for inspection. Export processes one image at a time. Both
 `sparse/` and `sparse/0/`, and binary/text COLMAP models, are supported; the model
 must retain `points3D.bin` or `points3D.txt` with point IDs. Use `-s NEW_DATASET_PATH`

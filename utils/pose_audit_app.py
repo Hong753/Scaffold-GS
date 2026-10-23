@@ -12,6 +12,7 @@ from PIL import Image
 import viser
 
 from utils.pose_audit_data import COLORS
+from utils.pose_audit_analysis import analyze_reprojection
 from utils.viewer_utils import overview_preset, quaternion_matrix
 
 
@@ -29,15 +30,26 @@ def pick_cameras(positions, wxyz, position, fov, width, height, screen_pos, radi
     return indices[np.lexsort((camera[indices, 2], distance[indices]))][:20].tolist()
 
 
-def image_html(png, filename, width, zoom="Fit"):
+def image_html(png, filename, width, zoom="Fit", query=b"", projection=b"", matched=True):
     """Keep the selected PNG at full resolution; native zoom scrolls, not resizes."""
     if not png:
         return '<p style="padding:12px">Select an image to inspect.</p>'
     size = "100%" if zoom == "Fit" else f"{width * (1 if zoom == '100%' else 2)}px"
-    encoded = base64.b64encode(png).decode("ascii")
-    return (f'<div style="max-height:68vh;overflow:auto;background:#10141b">'
-            f'<img alt="{html.escape(filename, quote=True)}" src="data:image/png;base64,{encoded}" '
-            f'style="display:block;width:{size};max-width:none;height:auto"></div>')
+    def picture(content, label):
+        encoded = base64.b64encode(content).decode("ascii")
+        return (f'<figure style="margin:0;min-width:0"><figcaption style="padding:8px 0;font-weight:600">{label}</figcaption>'
+                f'<div style="max-height:60vh;overflow:auto;background:#10141b">'
+                f'<img alt="{html.escape(filename, quote=True)}" src="data:image/png;base64,{encoded}" '
+                f'style="display:block;width:{size};max-width:none;height:auto"></div></figure>')
+    if not query or not projection:
+        return picture(png, "Matched reprojection overlay")
+    comparison = ('<div style="display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px">' +
+                  picture(query, "Captured RGB") + picture(projection, "Reprojected sparse cloud") + '</div>')
+    if matched:
+        comparison += picture(png, "Matched reprojection overlay: cyan observations / orange projections / red errors")
+    else:
+        comparison += '<p><strong>No 2D–3D matches: a residual overlay cannot be drawn.</strong> The cloud image above is a coarse visual comparison.</p>'
+    return comparison
 
 
 @dataclass
@@ -54,6 +66,9 @@ class AuditClient:
     download: bool = False
     find_matches: bool = False
     png: bytes = b""
+    query_png: bytes = b""
+    projection_png: bytes = b""
+    has_matches: bool = False
     filename: str = "pose_overlay.png"
     image_width: int = 0
     frustum: object = None
@@ -72,6 +87,7 @@ class _ClientGone(Exception):
 class PoseAuditApp:
     def __init__(self, data, host="0.0.0.0", port=8081, max_points=100000, max_frustums=120):
         self.data, self.clients = data, {}
+        self.analysis = data.analysis if data.analysis is not None else analyze_reprojection(data)
         self._initializing_clients = {}
         self._clients_lock = threading.RLock()
         self.wake, self.stopped = threading.Event(), threading.Event()
@@ -165,7 +181,7 @@ class PoseAuditApp:
             if not self._alive(state):
                 return
             state.controls["image"].content = image_html(state.png, state.filename, state.image_width,
-                                                         state.controls["zoom"].value)
+                state.controls["zoom"].value, state.query_png, state.projection_png, state.has_matches)
 
     def _overview(self, state, require_ready=True):
         if not self._alive(state, require_ready):
@@ -227,11 +243,27 @@ class PoseAuditApp:
         groups = self.data.groups()
         default = "Training subset" if "Training subset" in groups else "All COLMAP images"
         state.indices = groups[default]
+        first = state.indices[0]
+        if not self.analysis["views"][first]["measured_points"] and self.analysis["ranked_indices"]:
+            available = set(state.indices)
+            supported = [index for index in self.analysis["ranked_indices"] if index in available]
+            if not supported:
+                default = "All COLMAP images"
+                state.indices = groups[default]
+                supported = self.analysis["ranked_indices"]
+            first = supported[0]
         self._add_scene(state)
         self._require_connection(state)
         gui, controls = client.gui, state.controls
         gui.add_markdown(f"## Image / pose audit\n{len(self.data.frames):,} cameras · {len(self.data.xyz):,} SfM points\n\n"
                          "This is the **original sparse COLMAP model**. Green: training · purple: test · gray: other cameras.")
+        summary = self.analysis["summary"]
+        if summary["measured_views"]:
+            gui.add_markdown(f"**Automatic audit:** {summary['measured_views']:,}/{summary['total_views']:,} views measured. "
+                             f"Median per-view error: **{summary['median_view_error_px']:.3f} px** (original calibration pixels).")
+        else:
+            gui.add_markdown("**Numeric reprojection unavailable for every view.** " + summary["explanation"] +
+                             " The image inspector shows the photograph beside a separately reprojected sparse cloud.")
         if self.data.root is None:
             gui.add_markdown("Dataset-only audit: no saved training subset or preprocessing configuration was supplied.")
         if not self.data.selection_known:
@@ -241,7 +273,7 @@ class PoseAuditApp:
         self._require_connection(state)
         with gui.add_folder("Choose image"):
             controls["group"] = gui.add_dropdown("Views", list(groups), initial_value=default)
-            controls["index"] = gui.add_slider("Image index", 0, max(1, len(state.indices) - 1), 1, 0,
+            controls["index"] = gui.add_slider("Image index", 0, max(1, len(state.indices) - 1), 1, state.indices.index(first),
                                                disabled=len(state.indices) == 1)
             previous, following = gui.add_button("Previous image"), gui.add_button("Next image")
             controls["find"] = gui.add_text("Filename", "", hint="COLMAP filename or stem, e.g. 00961")
@@ -261,7 +293,7 @@ class PoseAuditApp:
             controls["matched"] = gui.add_checkbox("Highlight matched points", True)
             controls["photo"] = gui.add_checkbox("Image on selected frustum", False)
             controls["inspector"] = gui.add_checkbox("Show image inspector", True)
-        with gui.add_folder("Measurements", expand_by_default=False):
+        with gui.add_folder("Measurements", expand_by_default=True):
             controls["stats"] = gui.add_markdown("Loading image…")
 
         self._require_connection(state)
@@ -269,7 +301,7 @@ class PoseAuditApp:
         with state.panel.add_tab("Image inspector"):
             controls["image_title"] = gui.add_markdown("Loading image…")
             controls["space"] = gui.add_dropdown("Image space", ["Training input", "Original image"],
-                                                  initial_value="Training input" if self.data.root else "Original image")
+                                                  initial_value="Original image")
             controls["mode"] = gui.add_dropdown("Marks", ["Both", "Observations", "Projections", "None", "Cloud projection"],
                                                  initial_value="Both")
             controls["zoom"] = gui.add_dropdown("Image zoom", ["Fit", "100%", "200%"], initial_value="Fit")
@@ -277,12 +309,14 @@ class PoseAuditApp:
             controls["alignment"] = gui.add_markdown("Loading alignment status…")
             controls["image"] = gui.add_html(image_html(b"", "", 0))
             download = gui.add_button("Download overlay PNG")
-            gui.add_markdown("**Inspect:** select a frame → choose **100%** zoom and scroll the image → check whether cyan circles "
+            gui.add_markdown("**Left: captured RGB. Right: sparse cloud projected using this camera.** Black gaps have no sampled points. "
+                             "This is a sparse point depth buffer, not a complete surface visibility test or a trained Gaussian render. "
+                             "Below, matched reprojection marks appear when associations exist. Choose **100%** zoom and scroll the image to check whether cyan circles "
                              "and orange crosses coincide on real features. Red lines show their separation. "
                              "Resize or drag this panel to change the layout. Low residuals show internal SfM consistency; they do not rule out global drift or the wrong RGB file.")
         self._require_connection(state)
         state.panel.dock_left()
-        state.panel.set_width(min(640, max(320, client.camera.image_width * .38)))
+        state.panel.set_width(min(850, max(400, client.camera.image_width * .45)))
 
         @controls["group"].on_update
         def group_changed(_):
@@ -368,7 +402,7 @@ class PoseAuditApp:
         if state:
             with state.lock:
                 state.connected = state.ready = False
-                state.png = b""
+                state.png = state.query_png = state.projection_png = b""
         self.wake.set()
 
     def process(self, state):
@@ -394,8 +428,12 @@ class PoseAuditApp:
                         return False
                     state.controls["pick_status"].content = "No other image in the selected Views group has matching 3D point IDs. Try All COLMAP images, or Cloud projection."
             overlay, pixels, associated, details = self.data.inspect(index, space, limit, mode)
+            projection, _ = self.data.sparse_projection(index, details["training_size"], space)
             buffer = io.BytesIO()
             Image.fromarray(overlay).save(buffer, format="PNG", compress_level=1)
+            query_buffer, projection_buffer = io.BytesIO(), io.BytesIO()
+            Image.fromarray(pixels).save(query_buffer, format="PNG", compress_level=1)
+            Image.fromarray(projection).save(projection_buffer, format="PNG", compress_level=1)
 
             def metric(record):
                 return "unavailable" if record["median"] is None else f"{record['median']:.3f} / {record['p95']:.3f} px"
@@ -416,7 +454,9 @@ class PoseAuditApp:
                              "Compare their structure with RGB edges. These points have no matched 2D observations or occlusion test; "
                              "they are not a reprojection-error measurement.")
             else:
-                alignment = f"**{details['associated_points']:,} matched 3D points.** Cyan = stored features · orange = projections · red = residuals."
+                record = details["training_projection_px"] if space == "Training input" else details["colmap_reprojection_px"]
+                alignment = (f"**Reprojection median / p95: {metric(record)}** · {details['associated_points']:,} matched 3D points. "
+                             "Cyan = stored features · orange = projections · red = residuals.")
             if details["correspondence_status"]:
                 alignment = ("**No matched points: alignment cannot be scored.** " + details["correspondence_status"] +
                              " Try **Next image with matches**, or set **Marks → Cloud projection** for a coarse visual check.\n\n" +
@@ -444,6 +484,8 @@ class PoseAuditApp:
                     (0, 230, 255), point_size=self.data.radius * .0005, point_shape="circle", point_shading="flat",
                     precision="float32", visible=state.controls["matched"].value)
                 state.png, state.filename = buffer.getvalue(), f"pose_{Path(frame.name).stem}_{'training' if space == 'Training input' else 'raw'}.png"
+                state.query_png, state.projection_png = query_buffer.getvalue(), projection_buffer.getvalue()
+                state.has_matches = details["associated_points"] > 0
                 state.image_width = overlay.shape[1]
                 self._refresh_image(state)
                 if state.download:
@@ -459,7 +501,7 @@ class PoseAuditApp:
                 state.controls["name"].value = frame.name
                 state.controls["image_title"].content = f"**{frame.name}**"
                 state.controls["stats"].content = state.controls["alignment"].content = message
-                state.png = b""
+                state.png = state.query_png = state.projection_png = b""
                 self._refresh_image(state)
                 if state.frustum is not None:
                     state.frustum.remove()
@@ -497,5 +539,5 @@ class PoseAuditApp:
         for state in states:
             with state.lock:
                 state.connected = state.ready = False
-                state.png = b""
+                state.png = state.query_png = state.projection_png = b""
         self.server.stop()
