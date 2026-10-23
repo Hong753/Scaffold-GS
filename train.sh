@@ -8,7 +8,7 @@ function rand(){
 port=$(rand 10000 30000)
 
 lod=0
-iterations=30_000
+iterations=40_000
 warmup="False"
 frame_selection_stride=1
 frame_selection_max_size=1024

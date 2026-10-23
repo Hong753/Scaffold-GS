@@ -1,4 +1,4 @@
-scene='/data/colmap_scenes/TnT/Barn'
+scene='/data/hyejun_dataset/HandHeld/Orange_office_Colmap'
 exp_name='baseline'
 voxel_size=0.001
 update_init_factor=16
