@@ -2,6 +2,7 @@
 
 from argparse import Namespace
 import base64
+from contextlib import contextmanager
 import io
 import json
 from pathlib import Path
@@ -11,6 +12,7 @@ import struct
 import threading
 import time
 import urllib.request
+import warnings
 
 import cv2
 import numpy as np
@@ -346,3 +348,150 @@ def test_pose_audit_real_http_websocket_selection_and_png_download(tmp_path):
     finally:
         app.stop()
         worker.join(timeout=3)
+
+
+@contextmanager
+def audit_runtime(data):
+    """Exercise the real event loop while connect/decode callbacks are paused."""
+    from utils.pose_audit_app import PoseAuditApp
+
+    with socket.socket() as reserved:
+        reserved.bind(("127.0.0.1", 0))
+        port = reserved.getsockname()[1]
+    app = PoseAuditApp(data, host="127.0.0.1", port=port, max_points=100, max_frustums=4)
+    errors = []
+
+    def run():
+        try:
+            app.run()
+        except BaseException as error:
+            errors.append(error)
+
+    worker = threading.Thread(target=run, daemon=True)
+    worker.start()
+    try:
+        yield app, port
+    finally:
+        app.stop()
+        worker.join(timeout=3)
+        assert not worker.is_alive()
+        assert not errors, f"Audit loop crashed: {errors}"
+
+
+@contextmanager
+def audit_connection(port):
+    import msgspec
+    import websockets.sync.client
+
+    with websockets.sync.client.connect(f"ws://127.0.0.1:{port}", proxy=None,
+            subprotocols=["viser-v1.1.1"], max_size=20_000_000) as connection:
+        connection.send(msgspec.msgpack.encode(dict(type="ViewerCameraMessage", wxyz=[1., 0., 0., 0.],
+            position=[0., 0., -5.], fov=.8, near=.01, far=1000., image_height=800, image_width=1200,
+            look_at=[0., 0., 0.], up_direction=[0., -1., 0.])))
+        yield connection
+
+
+def wait_for(condition, timeout=5):
+    deadline = time.monotonic() + timeout
+    while not condition():
+        if time.monotonic() > deadline:
+            raise AssertionError("Timed out waiting for audit lifecycle condition")
+        threading.Event().wait(.005)
+
+
+def test_slow_connect_does_not_process_partial_controls(tmp_path, monkeypatch):
+    _, model = make_dataset(tmp_path)
+    data = PoseAuditData(model)
+    entered, release = threading.Event(), threading.Event()
+    with audit_runtime(data) as (app, port):
+        original = app._add_scene
+
+        def slow_scene(state):
+            entered.set()
+            assert release.wait(5)
+            original(state)
+
+        monkeypatch.setattr(app, "_add_scene", slow_scene)
+        try:
+            with audit_connection(port):
+                assert entered.wait(3)
+                assert not app.clients
+                state = next(iter(app._initializing_clients.values()))
+                assert state.controls == {} and not state.ready
+                # This raised KeyError('index') in the reported version.
+                assert app.process(state) is False
+                release.set()
+                wait_for(lambda: state.ready and bool(state.png))
+                assert app.clients[state.client.client_id] is state and "index" in state.controls
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize("phase", ["scene", "gui"])
+def test_disconnect_during_setup_cannot_publish_stale_client_and_reconnect_works(tmp_path, monkeypatch, phase):
+    _, model = make_dataset(tmp_path)
+    data = PoseAuditData(model)
+    entered, release = threading.Event(), threading.Event()
+    with warnings.catch_warnings(record=True) as captured, audit_runtime(data) as (app, port):
+        warnings.simplefilter("always")
+        name = "_add_scene" if phase == "scene" else "_initialize"
+        original = getattr(app, name)
+
+        def paused(state):
+            if phase == "gui":
+                original(state)
+            entered.set()
+            assert release.wait(5)
+            if phase == "scene":
+                original(state)
+
+        monkeypatch.setattr(app, name, paused)
+        try:
+            with audit_connection(port):
+                assert entered.wait(3)
+                old = next(iter(app._initializing_clients.values()))
+                assert not old.ready and not app.clients
+            wait_for(lambda: not app.server.get_clients())
+            release.set()
+            wait_for(lambda: not app._initializing_clients and not old.connected)
+            assert not app.clients and not old.ready
+            monkeypatch.setattr(app, name, original)
+            with audit_connection(port):
+                wait_for(lambda: bool(app.clients) and bool(next(iter(app.clients.values())).png))
+                current = next(iter(app.clients.values()))
+                assert current.client.client_id != old.client.client_id and current.ready
+        finally:
+            release.set()
+        assert not any("closed connection" in str(item.message) for item in captured)
+
+
+def test_disconnect_while_decoding_drops_result_and_server_accepts_new_client(tmp_path, monkeypatch):
+    _, model = make_dataset(tmp_path)
+    data = PoseAuditData(model)
+    entered, release, completed = threading.Event(), threading.Event(), threading.Event()
+    original = data.inspect
+
+    def slow_inspect(*args, **kwargs):
+        entered.set()
+        assert release.wait(5)
+        result = original(*args, **kwargs)
+        completed.set()
+        return result
+
+    monkeypatch.setattr(data, "inspect", slow_inspect)
+    with warnings.catch_warnings(record=True) as captured, audit_runtime(data) as (app, port):
+        warnings.simplefilter("always")
+        try:
+            with audit_connection(port):
+                assert entered.wait(3)
+                old = next(iter(app.clients.values()))
+            wait_for(lambda: not old.connected)
+            release.set()
+            assert completed.wait(3)
+            assert not old.ready and not old.png and not app.clients
+            monkeypatch.setattr(data, "inspect", original)
+            with audit_connection(port):
+                wait_for(lambda: bool(app.clients) and bool(next(iter(app.clients.values())).png))
+        finally:
+            release.set()
+        assert not any("closed connection" in str(item.message) for item in captured)

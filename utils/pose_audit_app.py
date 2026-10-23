@@ -50,6 +50,7 @@ class AuditClient:
     revision: int = 0
     rendered: int = -1
     connected: bool = True
+    ready: bool = False
     download: bool = False
     find_matches: bool = False
     png: bytes = b""
@@ -64,9 +65,15 @@ class AuditClient:
     panel: object = None
 
 
+class _ClientGone(Exception):
+    """Abort setup when a browser closes or the server stops mid-connection."""
+
+
 class PoseAuditApp:
     def __init__(self, data, host="0.0.0.0", port=8081, max_points=100000, max_frustums=120):
         self.data, self.clients = data, {}
+        self._initializing_clients = {}
+        self._clients_lock = threading.RLock()
         self.wake, self.stopped = threading.Event(), threading.Event()
         self.server = viser.ViserServer(host=host, port=port)
         self.server.gui.configure_theme(dark_mode=True, control_width="large")
@@ -79,7 +86,16 @@ class PoseAuditApp:
         self.server.on_client_connect(self._connect)
         self.server.on_client_disconnect(self._disconnect)
 
+    def _alive(self, state, require_ready=True):
+        return (not self.stopped.is_set() and state.connected and (state.ready or not require_ready)
+                and self.server.get_clients().get(state.client.client_id) is state.client)
+
+    def _require_connection(self, state):
+        if not self._alive(state, require_ready=False):
+            raise _ClientGone()
+
     def _add_scene(self, state):
+        self._require_connection(state)
         scene, data = state.client.scene, self.data
         state.cloud = scene.add_point_cloud(
             "/sfm_points", data.xyz[self.chosen].astype(np.float32), data.rgb[self.chosen],
@@ -93,6 +109,7 @@ class PoseAuditApp:
             state.trajectory = scene.add_line_segments("/trajectory", segments, (85, 118, 148),
                                                        thickness=1., thickness_units="screen")
         for index in self.frustum_indices:
+            self._require_connection(state)
             frame = data.frames[index]
             camera = data.cameras[frame.camera_id]
             k = data.options[frame.camera_id]["colmap_calibration"]["matrix"]
@@ -103,8 +120,9 @@ class PoseAuditApp:
                 thickness=1., thickness_units="screen", visible=False))
 
     def _pick(self, event):
-        state = self.clients.get(event.client_id)
-        if state is None:
+        with self._clients_lock:
+            state = self.clients.get(event.client_id)
+        if state is None or not self._alive(state):
             return
         camera = state.client.camera
         indices = pick_cameras(self.data.positions, camera.wxyz, camera.position, camera.fov,
@@ -122,10 +140,14 @@ class PoseAuditApp:
 
     def _dirty(self, state):
         with state.lock:
+            if not self._alive(state):
+                return
             state.revision += 1
         self.wake.set()
 
     def _display(self, state):
+        if not self._alive(state):
+            return
         controls = state.controls
         state.cloud.visible = controls["cloud"].value
         state.cloud.point_size = self.data.radius * .00025 * controls["point_size"].value
@@ -140,10 +162,14 @@ class PoseAuditApp:
 
     def _refresh_image(self, state):
         with state.lock:
+            if not self._alive(state):
+                return
             state.controls["image"].content = image_html(state.png, state.filename, state.image_width,
                                                          state.controls["zoom"].value)
 
-    def _overview(self, state):
+    def _overview(self, state, require_ready=True):
+        if not self._alive(state, require_ready):
+            return
         preset = overview_preset(self.data.center, self.data.radius, self.data.up)
         with state.client.atomic():
             state.client.camera.position = preset.position
@@ -153,6 +179,8 @@ class PoseAuditApp:
 
     def _look(self, state):
         with state.lock:
+            if not self._alive(state):
+                return
             index = state.indices[int(state.controls["index"].value)]
         frame = self.data.frames[index]
         camera = self.data.cameras[frame.camera_id]
@@ -165,11 +193,42 @@ class PoseAuditApp:
 
     def _connect(self, client):
         state = AuditClient(client)
+        with self._clients_lock:
+            if self.stopped.is_set():
+                return
+            self._initializing_clients[client.client_id] = state
+        try:
+            self._initialize(state)
+            with state.lock:
+                self._require_connection(state)
+                self._overview(state, require_ready=False)
+                # Publish only complete clients. Disconnect/stop removes the
+                # pending entry, preventing late setup from resurrecting it.
+                with self._clients_lock:
+                    self._require_connection(state)
+                    if self._initializing_clients.get(client.client_id) is not state:
+                        return
+                    state.ready = True
+                    del self._initializing_clients[client.client_id]
+                    self.clients[client.client_id] = state
+                self._dirty(state)
+        except _ClientGone:
+            pass
+        finally:
+            with self._clients_lock:
+                if self._initializing_clients.get(client.client_id) is state:
+                    del self._initializing_clients[client.client_id]
+            if not state.ready:
+                state.connected = False
+
+    def _initialize(self, state):
+        client = state.client
+        self._require_connection(state)
         groups = self.data.groups()
         default = "Training subset" if "Training subset" in groups else "All COLMAP images"
         state.indices = groups[default]
-        self.clients[client.client_id] = state
         self._add_scene(state)
+        self._require_connection(state)
         gui, controls = client.gui, state.controls
         gui.add_markdown(f"## Image / pose audit\n{len(self.data.frames):,} cameras · {len(self.data.xyz):,} SfM points\n\n"
                          "This is the **original sparse COLMAP model**. Green: training · purple: test · gray: other cameras.")
@@ -179,6 +238,7 @@ class PoseAuditApp:
             gui.add_markdown("**Saved selection manifest missing:** training membership below represents candidates.")
         if not any(frame.count for frame in self.data.frames):
             gui.add_markdown("**No stored feature observations in this model.** Use Cloud projection for a coarse visual check; residual measurements are unavailable.")
+        self._require_connection(state)
         with gui.add_folder("Choose image"):
             controls["group"] = gui.add_dropdown("Views", list(groups), initial_value=default)
             controls["index"] = gui.add_slider("Image index", 0, max(1, len(state.indices) - 1), 1, 0,
@@ -191,6 +251,7 @@ class PoseAuditApp:
             controls["pick_status"] = gui.add_markdown("**Click any camera dot** in the 3D view to select it. Drag to orbit; scroll to zoom.")
             look, home = gui.add_button("Look from camera"), gui.add_button("Scene overview")
             find_matches = gui.add_button("Next image with matches")
+        self._require_connection(state)
         with gui.add_folder("3D display", expand_by_default=False):
             controls["cloud"] = gui.add_checkbox("Show sparse cloud", True)
             controls["point_size"] = gui.add_slider("Point size", .25, 4., .25, 1.)
@@ -203,6 +264,7 @@ class PoseAuditApp:
         with gui.add_folder("Measurements", expand_by_default=False):
             controls["stats"] = gui.add_markdown("Loading image…")
 
+        self._require_connection(state)
         state.panel = gui.add_panel()
         with state.panel.add_tab("Image inspector"):
             controls["image_title"] = gui.add_markdown("Loading image…")
@@ -218,6 +280,7 @@ class PoseAuditApp:
             gui.add_markdown("**Inspect:** select a frame → choose **100%** zoom and scroll the image → check whether cyan circles "
                              "and orange crosses coincide on real features. Red lines show their separation. "
                              "Resize or drag this panel to change the layout. Low residuals show internal SfM consistency; they do not rule out global drift or the wrong RGB file.")
+        self._require_connection(state)
         state.panel.dock_left()
         state.panel.set_width(min(640, max(320, client.camera.image_width * .38)))
 
@@ -280,15 +343,15 @@ class PoseAuditApp:
                 state.download = True
             self._dirty(state)
 
-        self._overview(state)
-        self._dirty(state)
-
     def select_frame(self, client_id, index):
-        state = self.clients.get(client_id)
+        with self._clients_lock:
+            state = self.clients.get(client_id)
         if state is None:
             return
         controls = state.controls
         with state.lock:
+            if not self._alive(state):
+                return
             if index not in state.indices:
                 controls["group"].value = "All COLMAP images"
                 state.indices = self.data.groups()["All COLMAP images"]
@@ -298,13 +361,19 @@ class PoseAuditApp:
         self._dirty(state)
 
     def _disconnect(self, client):
-        state = self.clients.pop(client.client_id, None)
+        with self._clients_lock:
+            state = self.clients.pop(client.client_id, None)
+            pending = self._initializing_clients.pop(client.client_id, None)
+        state = state or pending
         if state:
-            state.connected = False
+            with state.lock:
+                state.connected = state.ready = False
+                state.png = b""
+        self.wake.set()
 
     def process(self, state):
         with state.lock:
-            if not state.connected or state.revision == state.rendered:
+            if not self._alive(state) or state.revision == state.rendered:
                 return False
             revision = state.revision
             index = state.indices[min(int(state.controls["index"].value), len(state.indices) - 1)]
@@ -317,7 +386,7 @@ class PoseAuditApp:
             if find_matches:
                 target = self.data.next_with_matches(index, indices)
                 with state.lock:
-                    if revision != state.revision:
+                    if not self._alive(state) or revision != state.revision:
                         return False
                     if target is not None:
                         self.select_frame(state.client.client_id, target)
@@ -353,7 +422,7 @@ class PoseAuditApp:
                              " Try **Next image with matches**, or set **Marks → Cloud projection** for a coarse visual check.\n\n" +
                              (alignment if mode == "Cloud projection" else "No correspondence marks are drawn on this image."))
             with state.lock:
-                if not state.connected or revision != state.revision:
+                if not self._alive(state) or revision != state.revision:
                     return False
                 state.controls["name"].value = frame.name
                 state.controls["image_title"].content = f"**{frame.name}** · {details['training_size'][0]} × {details['training_size'][1]} pixels · {frame.split}"
@@ -384,7 +453,7 @@ class PoseAuditApp:
             return True
         except (OSError, ValueError, RuntimeError) as error:
             with state.lock:
-                if not state.connected or revision != state.revision:
+                if not self._alive(state) or revision != state.revision:
                     return False
                 message = f"**Could not inspect image:** {error}"
                 state.controls["name"].value = frame.name
@@ -405,7 +474,9 @@ class PoseAuditApp:
     def run(self):
         try:
             while not self.stopped.is_set():
-                for state in list(self.clients.values()):
+                with self._clients_lock:
+                    states = list(self.clients.values())
+                for state in states:
                     self.process(state)
                 self.wake.wait(.1)
                 self.wake.clear()
@@ -419,6 +490,12 @@ class PoseAuditApp:
             return
         self.stopped.set()
         self.wake.set()
-        for state in list(self.clients.values()):
-            state.connected = False
+        with self._clients_lock:
+            states = list(self.clients.values()) + list(self._initializing_clients.values())
+            self.clients.clear()
+            self._initializing_clients.clear()
+        for state in states:
+            with state.lock:
+                state.connected = state.ready = False
+                state.png = b""
         self.server.stop()
