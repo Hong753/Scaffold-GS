@@ -257,6 +257,7 @@ class PoseAuditData:
         for frame in self.frames:
             counts[Path(frame.name).name] = counts.get(Path(frame.name).name, 0) + 1
         self.collisions = {name for name, count in counts.items() if count > 1}
+        self.association_counts = {}
 
     def image_path(self, frame):
         # Deliberately reproduce training's basename mapping, while reporting
@@ -271,6 +272,59 @@ class PoseAuditData:
                 groups[name] = values
         return groups
 
+    def frame_matches(self, index):
+        """Read only the selected feature records; preserve exact int64 IDs."""
+        xys, point_ids = read_observations(self.images_file, self.suffix, self.frames[index])
+        locations = np.searchsorted(self.ids, point_ids)
+        matched = np.zeros(len(point_ids), bool)
+        if len(self.ids):
+            matched = (point_ids >= 0) & (locations < len(self.ids))
+            matched &= self.ids[np.minimum(locations, len(self.ids) - 1)] == point_ids
+        self.association_counts[index] = int(matched.sum())
+        return xys, point_ids, locations, matched
+
+    def next_with_matches(self, index, indices):
+        """Find another supported view without opening or decoding any RGB files."""
+        start = indices.index(index) if index in indices else -1
+        for step in range(1, len(indices) + 1):
+            candidate = indices[(start + step) % len(indices)]
+            if candidate == index:
+                continue
+            if candidate not in self.association_counts:
+                if self.frames[candidate].count:
+                    self.frame_matches(candidate)
+                else:
+                    self.association_counts[candidate] = 0
+            if self.association_counts[candidate]:
+                return candidate
+        return None
+
+    def cloud_overlay(self, pixels, frame, calibration, training, limit):
+        """Coarse projection without observation matches or an occlusion test."""
+        chosen = np.linspace(0, len(self.xyz) - 1, min(100000, len(self.xyz)), dtype=int)
+        projected, camera_xyz = project_points(self.xyz[chosen], frame, calibration)
+        width, height = pixels.shape[1], pixels.shape[0]
+        if training:
+            matrix = np.array(calibration["matrix"])
+            with np.errstate(divide="ignore", invalid="ignore"):
+                projected = camera_xyz[:, :2] / camera_xyz[:, 2:3]
+                projected *= [matrix[0, 0] * width / calibration["width"],
+                              matrix[1, 1] * height / calibration["height"]]
+                projected += [(width - 1) / 2, (height - 1) / 2]
+        else:
+            projected = projected * [width / calibration["width"], height / calibration["height"]] - .5
+        valid = (camera_xyz[:, 2] > 0) & np.isfinite(projected).all(axis=1)
+        valid &= ((projected[:, 0] >= 0) & (projected[:, 0] < width) &
+                  (projected[:, 1] >= 0) & (projected[:, 1] < height))
+        visible = np.flatnonzero(valid)
+        if len(visible) > limit:
+            visible = visible[np.linspace(0, len(visible) - 1, limit, dtype=int)]
+        image = Image.fromarray(pixels)
+        draw = ImageDraw.Draw(image)
+        for x, y in projected[visible]:
+            draw.ellipse((x - 1.5, y - 1.5, x + 1.5, y + 1.5), outline=(255, 177, 49))
+        return np.asarray(image), len(visible)
+
     def inspect(self, index, space="Training input", limit=500, mode="Both"):
         from utils.image_loading import load_image_tensor, open_image
 
@@ -281,13 +335,7 @@ class PoseAuditData:
         with open_image(path) as source:
             source_size = source.size
         resolution = image_resolution(source_size, self.resolution)
-        xys, point_ids = read_observations(self.images_file, self.suffix, frame)
-        if len(self.ids):
-            locations = np.searchsorted(self.ids, point_ids)
-            matched = (point_ids >= 0) & (locations < len(self.ids))
-            matched &= self.ids[np.minimum(locations, len(self.ids) - 1)] == point_ids
-        else:
-            matched = np.zeros(len(point_ids), bool)
+        xys, point_ids, locations, matched = self.frame_matches(index)
         xyz = self.xyz[locations[matched]] if len(self.ids) else np.empty((0, 3))
         observed = xys[matched]
         projected, camera_xyz = project_points(xyz, frame, calibration)
@@ -331,6 +379,17 @@ class PoseAuditData:
             pixels[mask[0].numpy() < .5] = (35, 38, 44)
         overlay = overlay_image(pixels, (training_observed if training else raw_observed)[positive],
                                 (native if training else raw_projected)[positive], limit, mode)
+        cloud_points = 0
+        if mode == "Cloud projection":
+            overlay, cloud_points = self.cloud_overlay(pixels, frame, calibration, training, limit)
+        correspondence_status = ""
+        if not len(xyz):
+            if not len(point_ids):
+                correspondence_status = "This image has no stored 2D feature observations in the COLMAP images file."
+            elif not (point_ids >= 0).any():
+                correspondence_status = "This image has feature observations, but none are associated with a triangulated 3D point."
+            else:
+                correspondence_status = "This image references 3D point IDs absent from the loaded points3D model."
         warnings = []
         if Path(frame.name).name in self.collisions:
             warnings.append("Duplicate basenames: training can map different COLMAP images to the same RGB file.")
@@ -342,6 +401,9 @@ class PoseAuditData:
         details = {"image": frame.name, "split": frame.split, "training_path": str(path),
                    "source_size": list(source_size), "colmap_size": [calibration["width"], calibration["height"]],
                    "training_size": list(resolution), "associated_points": len(xyz),
+                   "feature_observations": len(point_ids),
+                   "triangulated_observations": int((point_ids >= 0).sum()),
+                   "correspondence_status": correspondence_status, "cloud_overlay_points": cloud_points,
                    "valid_training_points": int(training_valid.sum()),
                    "behind_camera": int((~positive).sum()),
                    "within_native_near_cull": int(((camera_xyz[:, 2] > 0) & (camera_xyz[:, 2] <= .2)).sum()),

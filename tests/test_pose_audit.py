@@ -1,9 +1,12 @@
 """Real COLMAP fixtures and a live HTTP/WebSocket test for the CPU pose audit."""
 
 from argparse import Namespace
+import base64
+import io
 import json
 from pathlib import Path
 import socket
+import re
 import struct
 import threading
 import time
@@ -139,6 +142,72 @@ def test_images_without_matching_3d_points_still_display(tmp_path):
     assert details["associated_points"] == 0 and details["training_projection_px"]["median"] is None
 
 
+@pytest.mark.parametrize("observations,reason", [
+    ("", "no stored 2D feature observations"),
+    ("10 10 -1", "none are associated with a triangulated"),
+    ("10 10 999", "IDs absent from the loaded")])
+def test_missing_correspondences_are_explained_and_next_match_does_not_decode_images(tmp_path, monkeypatch, observations, reason):
+    source, model = make_dataset(tmp_path, suffix="txt")
+    path = source / "sparse/0/images.txt"
+    lines = path.read_text().splitlines()
+    lines[4] = observations
+    path.write_text("\n".join(lines) + "\n")
+    data = PoseAuditData(model)
+    _, _, _, details = data.inspect(1)
+    assert reason in details["correspondence_status"]
+    assert details["associated_points"] == 0
+    with monkeypatch.context() as guard:
+        guard.setattr(Image.Image, "load", lambda *a, **k: pytest.fail("Search decoded RGB pixels"))
+        assert data.next_with_matches(1, [1, 2]) == 2
+        assert data.next_with_matches(1, [1]) is None
+        data.association_counts[2] = 0
+        assert data.next_with_matches(1, [1, 2]) is None
+
+
+@pytest.mark.parametrize("space", ["Original image", "Training input"])
+def test_cloud_projection_works_without_correspondences_and_does_not_invent_errors(tmp_path, space):
+    source, model = make_dataset(tmp_path, distortion=0.)
+    data = PoseAuditData(model)
+    data.frames[1].count = 0
+    overlay, pixels, _, details = data.inspect(1, space, mode="Cloud projection")
+    assert details["associated_points"] == 0 and details["cloud_overlay_points"] == 3
+    assert details["training_projection_px"]["median"] is None
+    assert details["colmap_reprojection_px"]["median"] is None
+    assert not np.array_equal(overlay, pixels)
+    for point in data.xyz:
+        camera = point @ data.frames[1].rotation.T + data.frames[1].tvec
+        x, y = np.round(camera[:2] / camera[2] * 125 + [79.5, 59.5]).astype(int)
+        patch = overlay[y - 3:y + 4, x - 3:x + 4]
+        assert ((patch == [255, 177, 49]).all(axis=2)).any()
+
+
+def test_camera_picking_is_screen_based_and_includes_unsampled_and_overlapping_cameras():
+    from utils.pose_audit_app import pick_cameras
+    positions = np.array([[0., 0, 5], [0., 0, -1], [.5, 0, 5], [0., 0, 3]])
+    assert pick_cameras(positions, [1, 0, 0, 0], np.zeros(3), np.pi / 2, 1000, 1000, [.5, .5]) == [3, 0]
+    assert pick_cameras(positions, [1, 0, 0, 0], np.zeros(3), np.pi / 2, 1000, 1000, [.55, .5]) == [2]
+    assert pick_cameras(positions, [1, 0, 0, 0], np.zeros(3), np.pi / 2, 1000, 1000, [.9, .1]) == []
+    yaw = .4
+    rotation = cv2.Rodrigues(np.array([0., yaw, 0.]))[0]
+    from utils.viewer_utils import matrix_quaternion
+    translated = np.array([1., 2., 3.])
+    world = positions @ rotation.T + translated
+    assert pick_cameras(world, matrix_quaternion(rotation), translated, np.pi / 2, 1000, 1000, [.55, .5]) == [2]
+
+
+def test_image_inspector_keeps_full_resolution_and_native_zoom_scrolls():
+    from utils.pose_audit_app import image_html
+    buffer = io.BytesIO()
+    Image.new("RGB", (1600, 1200), "navy").save(buffer, format="PNG")
+    page = image_html(buffer.getvalue(), '<frame "1">', 1600, "100%")
+    encoded = re.search(r"base64,([^\"]+)", page).group(1)
+    with Image.open(io.BytesIO(base64.b64decode(encoded))) as image:
+        assert image.size == (1600, 1200)
+    assert "width:1600px" in page and "overflow:auto" in page and "max-width:none" in page
+    assert '&lt;frame &quot;1&quot;&gt;' in page
+    assert "width:3200px" in image_html(buffer.getvalue(), "frame", 1600, "200%")
+
+
 def test_points_behind_camera_are_reported_and_excluded_from_overlay_statistics(tmp_path):
     source, model = make_dataset(tmp_path)
     data = PoseAuditData(model)
@@ -206,7 +275,7 @@ def test_pose_audit_real_http_websocket_selection_and_png_download(tmp_path):
     with socket.socket() as reserved:
         reserved.bind(("127.0.0.1", 0))
         port = reserved.getsockname()[1]
-    app = PoseAuditApp(data, host="127.0.0.1", port=port, max_points=100, max_frustums=4)
+    app = PoseAuditApp(data, host="127.0.0.1", port=port, max_points=100, max_frustums=1)
     worker = threading.Thread(target=app.run, daemon=True)
     worker.start()
     try:
@@ -244,18 +313,36 @@ def test_pose_audit_real_http_websocket_selection_and_png_download(tmp_path):
                 return widget and values.get(widget["uuid"], {}).get("value") == name
 
             receive_until(lambda: "Next image" in widgets and selected("frame2.png"))
-            assert {"PointCloudMessage", "CameraFrustumMessage", "GuiImageMessage"}.issubset(types)
+            assert {"PointCloudMessage", "CameraFrustumMessage", "GuiHtmlMessage", "GuiPanelMessage", "ScenePointerEnableMessage"}.issubset(types)
+            state = next(iter(app.clients.values()))
+            assert state.cloud.point_shape == "circle" and state.cloud.point_size < data.radius * .0003
+            # Zoom only changes presentation: it must not decode another image.
+            rendered = state.rendered
+            connection.send(msgspec.msgpack.encode(dict(type="GuiUpdateMessage", uuid=widgets["Image zoom"]["uuid"], updates={"value": "100%"})))
+            receive_until(lambda: "width:160px" in state.controls["image"].content)
+            assert state.rendered == rendered
             connection.send(msgspec.msgpack.encode(dict(type="GuiUpdateMessage", uuid=widgets["Next image"]["uuid"], updates={"value": True})))
             receive_until(lambda: selected("frame10.png"))
             connection.send(msgspec.msgpack.encode(dict(type="GuiUpdateMessage", uuid=widgets["Image space"]["uuid"], updates={"value": "Original image"})))
             connection.send(msgspec.msgpack.encode(dict(type="GuiUpdateMessage", uuid=widgets["Download overlay PNG"]["uuid"], updates={"value": True})))
             receive_until(lambda: len(downloads) > 0)
             assert downloads[-1]["filename"].endswith("_raw.png")
-            # A frustum outside the current training subset switches groups
-            # without losing the requested image to asynchronous GUI callbacks.
-            client_id = next(iter(app.clients))
-            app.select_frame(client_id, 3)
+            # Click an unsampled camera outside the current training subset.
+            # The only sampled frustum is frame1: frame11 must still be pickable.
+            connection.send(msgspec.msgpack.encode(dict(type="ViewerCameraMessage", wxyz=[1., 0., 0., 0.],
+                position=[.3, 0., -1.], fov=.8, near=.01, far=1000., image_height=800, image_width=1200,
+                look_at=[.3, 0., 0.], up_direction=[0., -1., 0.])))
+            connection.send(msgspec.msgpack.encode(dict(type="ScenePointerMessage", event_type="click",
+                ray_origin=[.3, 0., -1.], ray_direction=[0., 0., 1.], screen_pos=[[.5, .5]], modifier=None)))
             receive_until(lambda: selected("frame11.png"))
+            assert any("frame11.png" in label for label in state.candidates)
+            # A missing image must clear the displayed pixels and PNG, including at zoom.
+            (source / "images/frame11.png").unlink()
+            connection.send(msgspec.msgpack.encode(dict(type="GuiUpdateMessage", uuid=widgets["Marks"]["uuid"], updates={"value": "None"})))
+            receive_until(lambda: state.png == b"" and "Could not inspect" in state.controls["alignment"].content)
+            assert "base64," not in state.controls["image"].content
+            assert state.frustum is None and state.points is None
+            app._display(state)  # Changing display options cannot restore stale highlights.
     finally:
         app.stop()
         worker.join(timeout=3)

@@ -1,6 +1,8 @@
-"""CPU pose audit: 3D cameras/points with lazy, per-client image overlays."""
+"""CPU pose audit: readable images and camera picking across the full trajectory."""
 
+import base64
 from dataclasses import dataclass, field
+import html
 import io
 from pathlib import Path
 import threading
@@ -10,7 +12,32 @@ from PIL import Image
 import viser
 
 from utils.pose_audit_data import COLORS
-from utils.viewer_utils import overview_preset
+from utils.viewer_utils import overview_preset, quaternion_matrix
+
+
+def pick_cameras(positions, wxyz, position, fov, width, height, screen_pos, radius=14):
+    """Pick within a screen-pixel radius, independent of cloud or frustum meshes."""
+    camera = (positions - position) @ quaternion_matrix(wxyz)
+    valid = np.isfinite(camera).all(axis=1) & (camera[:, 2] > 1e-8)
+    projected = np.full((len(positions), 2), np.inf)
+    focal = height / (2 * np.tan(fov / 2))
+    projected[valid] = camera[valid, :2] / camera[valid, 2:3] * focal + [width / 2, height / 2]
+    distance = np.linalg.norm(projected - np.asarray(screen_pos) * [width, height], axis=1)
+    valid &= (distance <= radius)
+    indices = np.flatnonzero(valid)
+    # A depth tie-break makes coincident screen positions predictable.
+    return indices[np.lexsort((camera[indices, 2], distance[indices]))][:20].tolist()
+
+
+def image_html(png, filename, width, zoom="Fit"):
+    """Keep the selected PNG at full resolution; native zoom scrolls, not resizes."""
+    if not png:
+        return '<p style="padding:12px">Select an image to inspect.</p>'
+    size = "100%" if zoom == "Fit" else f"{width * (1 if zoom == '100%' else 2)}px"
+    encoded = base64.b64encode(png).decode("ascii")
+    return (f'<div style="max-height:68vh;overflow:auto;background:#10141b">'
+            f'<img alt="{html.escape(filename, quote=True)}" src="data:image/png;base64,{encoded}" '
+            f'style="display:block;width:{size};max-width:none;height:auto"></div>')
 
 
 @dataclass
@@ -18,15 +45,23 @@ class AuditClient:
     client: object
     controls: dict = field(default_factory=dict)
     indices: list = field(default_factory=list)
+    candidates: dict = field(default_factory=dict)
     lock: object = field(default_factory=threading.RLock)
     revision: int = 0
     rendered: int = -1
     connected: bool = True
     download: bool = False
+    find_matches: bool = False
     png: bytes = b""
     filename: str = "pose_overlay.png"
+    image_width: int = 0
     frustum: object = None
     points: object = None
+    cloud: object = None
+    centers: object = None
+    trajectory: object = None
+    frustums: list = field(default_factory=list)
+    panel: object = None
 
 
 class PoseAuditApp:
@@ -36,34 +71,77 @@ class PoseAuditApp:
         self.server = viser.ViserServer(host=host, port=port)
         self.server.gui.configure_theme(dark_mode=True, control_width="large")
         self.server.gui.main_panel.dock_right()
+        self.server.gui.main_panel.set_width(330)
         self.server.scene.set_up_direction(data.up)
-        chosen = np.linspace(0, len(data.xyz) - 1, min(len(data.xyz), max_points), dtype=int)
-        self.server.scene.add_point_cloud("/sfm_points", data.xyz[chosen].astype(np.float32),
-                                          data.rgb[chosen], point_size=data.radius * .0018, precision="float32")
-        self.server.scene.add_point_cloud("/camera_centers", data.positions.astype(np.float32),
-                                          np.array([COLORS[frame.split] for frame in data.frames], np.uint8),
-                                          point_size=data.radius * .006, precision="float32")
+        self.chosen = np.linspace(0, len(data.xyz) - 1, min(len(data.xyz), max_points), dtype=int)
+        self.frustum_indices = np.linspace(0, len(data.frames) - 1, min(max_frustums, len(data.frames)), dtype=int)
+        self.server.scene.on_click()(self._pick)
+        self.server.on_client_connect(self._connect)
+        self.server.on_client_disconnect(self._disconnect)
+
+    def _add_scene(self, state):
+        scene, data = state.client.scene, self.data
+        state.cloud = scene.add_point_cloud(
+            "/sfm_points", data.xyz[self.chosen].astype(np.float32), data.rgb[self.chosen],
+            point_size=data.radius * .00025, point_shape="circle", point_shading="flat", precision="float32")
+        state.centers = scene.add_point_cloud(
+            "/camera_centers", data.positions.astype(np.float32),
+            np.array([COLORS[frame.split] for frame in data.frames], np.uint8),
+            point_size=data.radius * .0007, point_shape="circle", point_shading="flat", precision="float32")
         if len(data.frames) > 1:
             segments = np.stack((data.positions[:-1], data.positions[1:]), axis=1).astype(np.float32)
-            self.server.scene.add_line_segments("/trajectory", segments, (85, 118, 148),
-                                                thickness=1., thickness_units="screen")
-        for index in np.linspace(0, len(data.frames) - 1, min(max_frustums, len(data.frames)), dtype=int):
+            state.trajectory = scene.add_line_segments("/trajectory", segments, (85, 118, 148),
+                                                       thickness=1., thickness_units="screen")
+        for index in self.frustum_indices:
             frame = data.frames[index]
             camera = data.cameras[frame.camera_id]
             k = data.options[frame.camera_id]["colmap_calibration"]["matrix"]
-            frustum = self.server.scene.add_camera_frustum(
+            state.frustums.append(scene.add_camera_frustum(
                 f"/cameras/{frame.id}", fov=2 * np.arctan(camera.height / (2 * k[1][1])),
-                aspect=camera.width * k[1][1] / (camera.height * k[0][0]), scale=data.radius * .012,
+                aspect=camera.width * k[1][1] / (camera.height * k[0][0]), scale=data.radius * .006,
                 color=COLORS[frame.split], position=frame.center, wxyz=frame.wxyz,
-                thickness=1., thickness_units="screen")
-            frustum.on_click(lambda event, index=int(index): self.select_frame(event.client_id, index))
-        self.server.on_client_connect(self._connect)
-        self.server.on_client_disconnect(self._disconnect)
+                thickness=1., thickness_units="screen", visible=False))
+
+    def _pick(self, event):
+        state = self.clients.get(event.client_id)
+        if state is None:
+            return
+        camera = state.client.camera
+        indices = pick_cameras(self.data.positions, camera.wxyz, camera.position, camera.fov,
+                               camera.image_width, camera.image_height, event.screen_pos)
+        if not indices:
+            state.controls["pick_status"].content = "No camera within 14 pixels. Click a colored dot, or use Filename / Next image."
+            return
+        with state.lock:
+            state.candidates = {f"{index + 1}: {self.data.frames[index].name}": index for index in indices}
+            state.controls["nearby"].options = list(state.candidates)
+            state.controls["nearby"].value = next(iter(state.candidates))
+            state.controls["pick_status"].content = (f"{len(indices)} nearby camera(s). Use **Nearby cameras** when dots overlap. "
+                                                     "Drag to orbit; scroll to zoom.")
+        self.select_frame(event.client_id, indices[0])
 
     def _dirty(self, state):
         with state.lock:
             state.revision += 1
         self.wake.set()
+
+    def _display(self, state):
+        controls = state.controls
+        state.cloud.visible = controls["cloud"].value
+        state.cloud.point_size = self.data.radius * .00025 * controls["point_size"].value
+        state.centers.point_size = self.data.radius * .0007 * controls["camera_size"].value
+        for handle in state.frustums:
+            handle.visible = controls["frustums"].value
+        if state.trajectory is not None:
+            state.trajectory.visible = controls["trajectory"].value
+        if state.points is not None:
+            state.points.visible = controls["matched"].value
+        state.panel.visible = controls["inspector"].value
+
+    def _refresh_image(self, state):
+        with state.lock:
+            state.controls["image"].content = image_html(state.png, state.filename, state.image_width,
+                                                         state.controls["zoom"].value)
 
     def _overview(self, state):
         preset = overview_preset(self.data.center, self.data.radius, self.data.up)
@@ -91,14 +169,16 @@ class PoseAuditApp:
         default = "Training subset" if "Training subset" in groups else "All COLMAP images"
         state.indices = groups[default]
         self.clients[client.client_id] = state
-        gui = client.gui
+        self._add_scene(state)
+        gui, controls = client.gui, state.controls
         gui.add_markdown(f"## Image / pose audit\n{len(self.data.frames):,} cameras · {len(self.data.xyz):,} SfM points\n\n"
-                         "Green: training · purple: test · gray: other cameras. Click a camera frustum to inspect it.")
+                         "This is the **original sparse COLMAP model**. Green: training · purple: test · gray: other cameras.")
         if self.data.root is None:
             gui.add_markdown("Dataset-only audit: no saved training subset or preprocessing configuration was supplied.")
         if not self.data.selection_known:
             gui.add_markdown("**Saved selection manifest missing:** training membership below represents candidates.")
-        controls = state.controls
+        if not any(frame.count for frame in self.data.frames):
+            gui.add_markdown("**No stored feature observations in this model.** Use Cloud projection for a coarse visual check; residual measurements are unavailable.")
         with gui.add_folder("Choose image"):
             controls["group"] = gui.add_dropdown("Views", list(groups), initial_value=default)
             controls["index"] = gui.add_slider("Image index", 0, max(1, len(state.indices) - 1), 1, 0,
@@ -107,34 +187,62 @@ class PoseAuditApp:
             controls["find"] = gui.add_text("Filename", "", hint="COLMAP filename or stem, e.g. 00961")
             find = gui.add_button("Find image")
             controls["name"] = gui.add_text("Selected image", "", disabled=True)
+            controls["nearby"] = gui.add_dropdown("Nearby cameras", ["Click a camera dot"])
+            controls["pick_status"] = gui.add_markdown("**Click any camera dot** in the 3D view to select it. Drag to orbit; scroll to zoom.")
             look, home = gui.add_button("Look from camera"), gui.add_button("Scene overview")
-        with gui.add_folder("Inspect alignment"):
+            find_matches = gui.add_button("Next image with matches")
+        with gui.add_folder("3D display", expand_by_default=False):
+            controls["cloud"] = gui.add_checkbox("Show sparse cloud", True)
+            controls["point_size"] = gui.add_slider("Point size", .25, 4., .25, 1.)
+            controls["camera_size"] = gui.add_slider("Camera marker size", .25, 4., .25, 1.)
+            controls["frustums"] = gui.add_checkbox("Show sampled frustums", False)
+            controls["trajectory"] = gui.add_checkbox("Show trajectory", True)
+            controls["matched"] = gui.add_checkbox("Highlight matched points", True)
+            controls["photo"] = gui.add_checkbox("Image on selected frustum", False)
+            controls["inspector"] = gui.add_checkbox("Show image inspector", True)
+        with gui.add_folder("Measurements", expand_by_default=False):
+            controls["stats"] = gui.add_markdown("Loading image…")
+
+        state.panel = gui.add_panel()
+        with state.panel.add_tab("Image inspector"):
+            controls["image_title"] = gui.add_markdown("Loading image…")
             controls["space"] = gui.add_dropdown("Image space", ["Training input", "Original image"],
                                                   initial_value="Training input" if self.data.root else "Original image")
-            controls["mode"] = gui.add_dropdown("Marks", ["Both", "Observations", "Projections", "None"],
+            controls["mode"] = gui.add_dropdown("Marks", ["Both", "Observations", "Projections", "None", "Cloud projection"],
                                                  initial_value="Both")
+            controls["zoom"] = gui.add_dropdown("Image zoom", ["Fit", "100%", "200%"], initial_value="Fit")
             controls["limit"] = gui.add_slider("Overlay points", 50, 2000, 50, 500)
-            controls["photo"] = gui.add_checkbox("Image on selected frustum", False)
+            controls["alignment"] = gui.add_markdown("Loading alignment status…")
+            controls["image"] = gui.add_html(image_html(b"", "", 0))
             download = gui.add_button("Download overlay PNG")
-            controls["stats"] = gui.add_markdown("Loading image…")
-            controls["image"] = gui.add_image(np.zeros((16, 24, 3), np.uint8), label="Image overlay", format="png")
-        gui.add_markdown("**Cyan circles:** COLMAP feature observations. **Orange crosses:** projected 3D points. "
-                         "**Red lines:** residuals. Download the PNG to inspect at training resolution.\n\n"
-                         "Low residuals show COLMAP self-consistency. Check that marks actually land on the correct "
-                         "features in the RGB image; low residuals alone do not verify frame identities or global accuracy.")
+            gui.add_markdown("**Inspect:** select a frame → choose **100%** zoom and scroll the image → check whether cyan circles "
+                             "and orange crosses coincide on real features. Red lines show their separation. "
+                             "Resize or drag this panel to change the layout. Low residuals show internal SfM consistency; they do not rule out global drift or the wrong RGB file.")
+        state.panel.dock_left()
+        state.panel.set_width(min(640, max(320, client.camera.image_width * .38)))
 
         @controls["group"].on_update
         def group_changed(_):
             with state.lock:
-                previous = state.indices[min(int(controls["index"].value), len(state.indices) - 1)]
+                previous_index = state.indices[min(int(controls["index"].value), len(state.indices) - 1)]
                 state.indices = groups[controls["group"].value]
                 controls["index"].max = max(1, len(state.indices) - 1)
                 controls["index"].disabled = len(state.indices) == 1
-                controls["index"].value = state.indices.index(previous) if previous in state.indices else 0
+                controls["index"].value = state.indices.index(previous_index) if previous_index in state.indices else 0
             self._dirty(state)
 
         for key in ("index", "space", "mode", "limit", "photo"):
             controls[key].on_update(lambda _, state=state: self._dirty(state))
+        for key in ("cloud", "point_size", "camera_size", "frustums", "trajectory", "matched", "inspector"):
+            controls[key].on_update(lambda _, state=state: self._display(state))
+        controls["zoom"].on_update(lambda _: self._refresh_image(state))
+
+        @controls["nearby"].on_update
+        def nearby_changed(_):
+            with state.lock:
+                index = state.candidates.get(controls["nearby"].value)
+            if index is not None:
+                self.select_frame(client.client_id, index)
 
         @previous.on_click
         def prev(_):
@@ -154,7 +262,14 @@ class PoseAuditApp:
             if len(matches) == 1:
                 self.select_frame(client.client_id, matches[0])
             else:
-                controls["stats"].content = f"Found {len(matches)} matches. Enter a unique COLMAP filename."
+                controls["pick_status"].content = f"Found {len(matches)} matches. Enter a unique COLMAP filename."
+
+        @find_matches.on_click
+        def seek_matches(_):
+            with state.lock:
+                state.find_matches = True
+                controls["pick_status"].content = "Checking feature records for another image with valid matches…"
+            self._dirty(state)
 
         look.on_click(lambda _: self._look(state))
         home.on_click(lambda _: self._overview(state))
@@ -195,16 +310,29 @@ class PoseAuditApp:
             index = state.indices[min(int(state.controls["index"].value), len(state.indices) - 1)]
             space, mode = state.controls["space"].value, state.controls["mode"].value
             limit, photo = int(state.controls["limit"].value), state.controls["photo"].value
+            find_matches, indices = state.find_matches, state.indices.copy()
+            state.find_matches = False
         frame = self.data.frames[index]
         try:
+            if find_matches:
+                target = self.data.next_with_matches(index, indices)
+                with state.lock:
+                    if revision != state.revision:
+                        return False
+                    if target is not None:
+                        self.select_frame(state.client.client_id, target)
+                        state.controls["pick_status"].content = f"Found matched features: {self.data.frames[target].name}"
+                        return False
+                    state.controls["pick_status"].content = "No other image in the selected Views group has matching 3D point IDs. Try All COLMAP images, or Cloud projection."
             overlay, pixels, associated, details = self.data.inspect(index, space, limit, mode)
             buffer = io.BytesIO()
             Image.fromarray(overlay).save(buffer, format="PNG", compress_level=1)
-            thumbnail = Image.fromarray(overlay)
-            thumbnail.thumbnail((1000, 1000))
+
             def metric(record):
                 return "unavailable" if record["median"] is None else f"{record['median']:.3f} / {record['p95']:.3f} px"
+
             stats = (f"**{frame.split}** · RGB {details['source_size']} · training {details['training_size']}\n\n"
+                     f"Stored features: **{details['feature_observations']:,}** · triangulated IDs: {details['triangulated_observations']:,}\n\n"
                      f"Associated points: **{details['associated_points']:,}** · valid training points: {details['valid_training_points']:,} · behind camera: {details['behind_camera']}\n\n"
                      f"COLMAP median / p95: **{metric(details['colmap_reprojection_px'])}** (original calibration size)\n\n"
                      f"Training median / p95: **{metric(details['training_projection_px'])}** (training pixels)\n\n"
@@ -214,13 +342,23 @@ class PoseAuditApp:
                           f"{details['previous_rotation_degrees']:.2f}°")
             if details["warnings"]:
                 stats += "\n\n" + "\n\n".join(f"**Check:** {warning}" for warning in details["warnings"])
+            if mode == "Cloud projection":
+                alignment = (f"**Coarse cloud projection:** {details['cloud_overlay_points']:,} orange points. "
+                             "Compare their structure with RGB edges. These points have no matched 2D observations or occlusion test; "
+                             "they are not a reprojection-error measurement.")
+            else:
+                alignment = f"**{details['associated_points']:,} matched 3D points.** Cyan = stored features · orange = projections · red = residuals."
+            if details["correspondence_status"]:
+                alignment = ("**No matched points: alignment cannot be scored.** " + details["correspondence_status"] +
+                             " Try **Next image with matches**, or set **Marks → Cloud projection** for a coarse visual check.\n\n" +
+                             (alignment if mode == "Cloud projection" else "No correspondence marks are drawn on this image."))
             with state.lock:
                 if not state.connected or revision != state.revision:
                     return False
                 state.controls["name"].value = frame.name
+                state.controls["image_title"].content = f"**{frame.name}** · {details['training_size'][0]} × {details['training_size'][1]} pixels · {frame.split}"
                 state.controls["stats"].content = stats
-                state.controls["image"].image = np.asarray(thumbnail)
-                width, height = details["training_size"]
+                state.controls["alignment"].content = alignment
                 k = self.data.options[frame.camera_id]["colmap_calibration"]["matrix"]
                 source_height = self.data.cameras[frame.camera_id].height
                 source_width = self.data.cameras[frame.camera_id].width
@@ -229,13 +367,16 @@ class PoseAuditApp:
                 state.frustum = state.client.scene.add_camera_frustum(
                     "/selected_camera", fov=2 * np.arctan(source_height / (2 * k[1][1])),
                     aspect=source_width * k[1][1] / (source_height * k[0][0]),
-                    scale=self.data.radius * .025, color=(255, 183, 65),
+                    scale=self.data.radius * .018, color=(255, 183, 65),
                     image=np.asarray(photo_image) if photo else None, format="png",
                     position=frame.center, wxyz=frame.wxyz, thickness=2., thickness_units="screen")
                 state.points = state.client.scene.add_point_cloud(
                     "/selected_points", associated[::max(1, len(associated) // 5000)].astype(np.float32),
-                    (0, 230, 255), point_size=self.data.radius * .003, precision="float32")
+                    (0, 230, 255), point_size=self.data.radius * .0005, point_shape="circle", point_shading="flat",
+                    precision="float32", visible=state.controls["matched"].value)
                 state.png, state.filename = buffer.getvalue(), f"pose_{Path(frame.name).stem}_{'training' if space == 'Training input' else 'raw'}.png"
+                state.image_width = overlay.shape[1]
+                self._refresh_image(state)
                 if state.download:
                     state.client.send_file_download(state.filename, state.png)
                     state.download = False
@@ -243,13 +384,20 @@ class PoseAuditApp:
             return True
         except (OSError, ValueError, RuntimeError) as error:
             with state.lock:
+                if not state.connected or revision != state.revision:
+                    return False
+                message = f"**Could not inspect image:** {error}"
                 state.controls["name"].value = frame.name
-                state.controls["stats"].content = f"**Could not inspect image:** {error}"
-                state.controls["image"].image = np.zeros((16, 24, 3), np.uint8)
+                state.controls["image_title"].content = f"**{frame.name}**"
+                state.controls["stats"].content = state.controls["alignment"].content = message
+                state.png = b""
+                self._refresh_image(state)
                 if state.frustum is not None:
-                    state.frustum.visible = False
+                    state.frustum.remove()
+                    state.frustum = None
                 if state.points is not None:
-                    state.points.visible = False
+                    state.points.remove()
+                    state.points = None
                 state.rendered = revision
                 state.download = False
             return False

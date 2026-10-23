@@ -316,15 +316,27 @@ python pose_audit.py -m "${runs[-1]}" --port 8081
 
 Open `http://localhost:8081`, or use the training machine's IP. It uses the same
 `viser==1.1.1` dependency as the native renderer (`pip install -r requirements-viewer.txt`).
-The 3D view shows the sparse cloud, camera centers, trajectory and clickable
-frustums. Green cameras belong to the saved training subset, purple cameras are
-held out, and gray cameras were not selected. Select images with the slider,
-Previous/Next buttons, filename search, or by clicking a sampled frustum. The
-selected camera and its associated 3D points are highlighted. `Look from camera`
+The 3D view shows the **original sparse COLMAP cloud**, camera positions and
+trajectory. Its dots are sparse landmarks, not a Gaussian rendering. Green
+cameras belong to the saved training subset, purple cameras are held out, and
+gray cameras were not selected. **Click any colored camera dot** to select it;
+picking searches all cameras within 14 screen pixels, independently of the
+sampled wireframes or intervening cloud points. When cameras overlap, use the
+`Nearby cameras` list to choose among the closest 20. The slider, Previous/Next
+buttons and filename search also work. Drag the scene to orbit and scroll to
+zoom. The selected camera and its associated 3D points are highlighted.
+`3D display` controls cloud/marker size and visibility; sampled frustums are
+hidden by default to keep the trajectory readable. `Look from camera`
 sets the pose and vertical FOV; the browser viewport aspect can differ from the
 source image, so use the 2D overlays for pixel-level alignment.
 
-In the image panel:
+The separate, resizable **Image inspector** starts on the left. Its PNG retains
+the complete training resolution. `Image zoom → 100%` shows one image pixel per
+CSS pixel; scroll inside the image to inspect different regions. `200%` enlarges
+the pixels further; `Fit` shows the full frame. Drag or resize the panel, or
+hide it with `Show image inspector` under `3D display`.
+
+In the image inspector:
 
 * **Cyan circles:** COLMAP's stored 2D feature observations.
 * **Orange crosses:** associated 3D points projected using that image's pose.
@@ -333,9 +345,23 @@ In the image panel:
   COLMAP lens distortion and principal point in the projection.
 * **Training input:** the exact lazy training loader, including cached
   undistortion if enabled, compared with the native renderer's pinhole projection.
+* **Cloud projection:** orange dots from up to 100,000 sampled sparse points,
+  projected into the image even when no 2D–3D associations were retained. Compare
+  broad structure with RGB edges. There is no observation matching or occlusion
+  test, so this mode cannot establish reprojection error; points from hidden
+  surfaces can also appear. It respects the chosen image-space projection.
 
-The panel reports median/p95 reprojection error, point counts, previous-frame
-translation/rotation, and path/aspect-ratio warnings. COLMAP residuals are in the
+**If Associated points is 0:** no correspondence overlay or residual measurement
+is possible for that frame. The inspector distinguishes missing stored 2D
+observations, untriangulated features, and referenced IDs absent from points3D.
+This does not itself mean the pose is wrong. `Next image with matches` searches
+the chosen Views group without decoding RGB files; try `All COLMAP images` if
+the selected subset has no matches. If observations were stripped from the
+entire model, use `Cloud projection` for a coarse check or recover the original
+SfM files with their feature associations for residual analysis.
+
+The `Measurements` folder reports median/p95 reprojection error, point counts,
+previous-frame translation/rotation, and path/aspect-ratio warnings. COLMAP residuals are in the
 original calibration's pixels; training residuals are in training pixels.
 Statistics include all supported associated points; the overlay is sampled for
 readability. `Download overlay PNG` saves at the actual training resolution.
