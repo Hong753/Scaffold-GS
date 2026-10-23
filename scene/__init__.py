@@ -17,6 +17,7 @@ from scene.dataset_readers import sceneLoadTypeCallbacks
 from scene.gaussian_model import GaussianModel
 from arguments import ModelParams
 from utils.camera_utils import cameraList_from_camInfos, camera_to_JSON
+from utils.frame_selection import select_training_frames
 
 class Scene:
 
@@ -48,6 +49,14 @@ class Scene:
             scene_info = sceneLoadTypeCallbacks["Blender"](args.source_path, args.white_background, args.eval, ply_path=ply_path)
         else:
             assert False, "Could not recognize scene type!"
+
+        scene_info = scene_info._replace(train_cameras=select_training_frames(
+            scene_info.train_cameras,
+            stride=getattr(args, "frame_selection_stride", 1),
+            max_size=getattr(args, "frame_selection_max_size", 1024),
+            workers=getattr(args, "frame_selection_workers", 4),
+            manifest_path=os.path.join(self.model_path, "frame_selection.json"),
+            reuse_manifest=self.loaded_iter is not None))
 
         self.gaussians.set_appearance(len(scene_info.train_cameras))
         

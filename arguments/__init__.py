@@ -61,6 +61,9 @@ class ModelParams(ParamGroup):
         self._resolution = -1
         self._white_background = False
         self.data_device = "cuda"
+        self.frame_selection_stride = 1
+        self.frame_selection_max_size = 1024
+        self.frame_selection_workers = 4
         self.eval = False
         self.lod = 0
 

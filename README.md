@@ -174,6 +174,40 @@ For training a single scene, modify the path and configurations in ```single_tra
 bash ./single_train.sh
 ```
 
+For sequential video frames, `single_train.sh` defaults to
+`--frame_selection_stride 3`. Training frames are sorted by filename in natural
+numeric order (`frame2` before `frame10`), grouped into consecutive blocks of
+three, and the frame with the highest **variance of the Laplacian** is selected
+from each block. A partial final block also contributes one frame. For 15,000
+training images this selects 5,000 images. Selection runs after the train/test
+split; held-out cameras keep their existing membership. Corrupt candidates are
+excluded, and an entirely corrupt block contributes no frame.
+
+Sharpness is computed on grayscale images resized to at most 1,024 pixels on
+their longest side, using four CPU workers. This is a sharpness proxy suitable
+for nearby video frames. Only the scoring workers temporarily hold image pixels;
+optimization still loads the selected images from disk on demand.
+The first run scans the training images with a progress bar. Scores and selected
+paths are cached under `outputs/frame_selection/`, keyed by paths, file sizes,
+modification times and selection settings. Each model also saves
+`frame_selection.json` with all scores and selected paths; rendering a saved model
+reuses that exact selection without rescoring.
+
+```bash
+# Default: best frame per group of 3.
+bash ./single_train.sh
+
+# Change the stride, or set it to 1 to use all frames.
+bash ./single_train.sh --frame_selection_stride 5
+bash ./single_train.sh --frame_selection_stride 1
+
+# Optional scoring settings; max_size=0 scores at native image resolution.
+bash ./single_train.sh --frame_selection_stride 3 --frame_selection_max_size 0 --frame_selection_workers 4
+```
+
+The same options work with `train.sh` and `train.py`. Their stride defaults to 1,
+so existing batch scripts continue to use all their training frames.
+
 - scene: scene name with a format of ```dataset_name/scene_name/``` or ```scene_name/```;
 - exp_name: user-defined experiment name;
 - gpu: specify the GPU id to run the code. '-1' denotes using the most idle GPU. 
