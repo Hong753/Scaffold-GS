@@ -304,6 +304,66 @@ Rebuild the summary without training:
 python compare_undistortion.py -o outputs/office_undistortion_ablation --summarize
 ```
 
+### Visually audit image / camera alignment
+
+Run this alongside training; it uses the original COLMAP model and needs no GPU
+or saved Gaussian checkpoint:
+
+```bash
+runs=(outputs/data/hyejun_dataset/HandHeld/Orange_office_Colmap/undistorted/*/)
+python pose_audit.py -m "${runs[-1]}" --port 8081
+```
+
+Open `http://localhost:8081`, or use the training machine's IP. It uses the same
+`viser==1.1.1` dependency as the native renderer (`pip install -r requirements-viewer.txt`).
+The 3D view shows the sparse cloud, camera centers, trajectory and clickable
+frustums. Green cameras belong to the saved training subset, purple cameras are
+held out, and gray cameras were not selected. Select images with the slider,
+Previous/Next buttons, filename search, or by clicking a sampled frustum. The
+selected camera and its associated 3D points are highlighted. `Look from camera`
+sets the pose and vertical FOV; the browser viewport aspect can differ from the
+source image, so use the 2D overlays for pixel-level alignment.
+
+In the image panel:
+
+* **Cyan circles:** COLMAP's stored 2D feature observations.
+* **Orange crosses:** associated 3D points projected using that image's pose.
+* **Red lines:** residuals between observations and projections.
+* **Original image:** original RGB resized to training resolution, with full
+  COLMAP lens distortion and principal point in the projection.
+* **Training input:** the exact lazy training loader, including cached
+  undistortion if enabled, compared with the native renderer's pinhole projection.
+
+The panel reports median/p95 reprojection error, point counts, previous-frame
+translation/rotation, and path/aspect-ratio warnings. COLMAP residuals are in the
+original calibration's pixels; training residuals are in training pixels.
+Statistics include all supported associated points; the overlay is sampled for
+readability. `Download overlay PNG` saves at the actual training resolution.
+Camera metadata is indexed once, while per-image observations and pixels load
+on selection; the audit does not load all video frames or feature arrays into RAM.
+
+**How to interpret it:** observations and projections should coincide and land
+on the corresponding real image features. Low reprojection error shows COLMAP
+self-consistency; it cannot prove that an RGB file still contains the frame used
+for SfM, or rule out global drift, rolling shutter or exposure variation. Check
+multiple regions and revisited locations. The training overlay accounts for
+COLMAP's corner-based coordinates and the CUDA rasterizer's pixel-center mapping.
+Pruned/moved Gaussians are not used: these overlays audit the original sparse
+reconstruction and the image preprocessing.
+
+For an offline report of 24 evenly spaced training images:
+
+```bash
+python pose_audit.py -m "${runs[-1]}" --report_only --views 24
+```
+
+Open the printed `RUN/pose_audit/index.html`; `summary.json` and the two PNGs per
+image can be shared for inspection. Export processes one image at a time. Both
+`sparse/` and `sparse/0/`, and binary/text COLMAP models, are supported; the model
+must retain `points3D.bin` or `points3D.txt` with point IDs. Use `-s NEW_DATASET_PATH`
+to override a saved source path. Without `-m`, `-s DATASET` audits raw COLMAP input
+with default resolution -1 and no assumed saved training subset.
+
 ### SuperSplat-compatible PLY saving
 
 Training saves at **7,000 and 30,000 iterations** by default (and at the final
